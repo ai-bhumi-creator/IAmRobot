@@ -4238,6 +4238,28 @@ function drawControlPoints(path) {
     .map((p, pointIndex) => ({ pointIndex, type: p.type, x: p.x, y: p.y }))
     .filter(p => p.type === 'M' || p.type === 'L' || p.type === 'Q' || p.type === 'C');
 
+  // ✅ FIX: remove duplicate start anchor (common with explicit close C OR zero-length first segment)
+  if (anchors.length > 1) {
+    const a0 = anchors[0];
+    const eps = 1e-6;
+
+    // 1) if the last anchor equals the first (explicit close), remove last
+    {
+      const aN = anchors[anchors.length - 1];
+      if (Math.abs(aN.x - a0.x) < eps && Math.abs(aN.y - a0.y) < eps) {
+        anchors.pop();
+      }
+    }
+
+    // 2) if the second anchor equals the first (redundant first segment), remove second
+    if (anchors.length > 1) {
+      const a1 = anchors[1];
+      if (Math.abs(a1.x - a0.x) < eps && Math.abs(a1.y - a0.y) < eps) {
+        anchors.splice(1, 1);
+      }
+    }
+  }
+
   anchors.forEach((pt, index) => {
     const w = localToWorld(path, pt.x, pt.y);
 
