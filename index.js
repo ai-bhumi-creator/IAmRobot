@@ -1852,6 +1852,11 @@ document.getElementById('removeLayer').onclick = (e) => {
   removeTimelineLayer(); // removes active
 };
 
+document.getElementById('insertFrame').onclick = (e) => {
+  e.stopPropagation();
+  addBlankFrameAfterLast(activeTimelineLayerId);
+};
+
 document.getElementById('bringToFront').onclick = () => {
   bringToFront();
 };
@@ -4778,6 +4783,8 @@ window.addEventListener('mousemove', e => {
 });
 
 window.addEventListener('mouseup', (event) => {
+  const didMutate = drawing || rectDrawing || ellipseDrawing || draggingPath || isHandleDragging || isDragging || isRotateDragging;
+
   ignoreDeselect = false; // ✅ ADD THIS FIRST LINE
 
   if (isHandleDragging) {
@@ -4901,6 +4908,10 @@ window.addEventListener('mouseup', (event) => {
 
     clearControlPoints(); // optional: shows updated anchors
   }
+
+  if (didMutate) {
+    saveActiveLayerToKeyframe();
+  }
 });
 
 window.addEventListener('pointerup', function () {
@@ -5022,6 +5033,9 @@ let activeTimelineLayerId = null;
 let rulerScrubbing = false;
 let rulerPointerId = null;
 
+// layerId -> Map(frameIndex -> innerHTML string)
+const keyframeStore = new Map();
+
 function updateTimelineScrollWidth() {
   if (!timelineHScroll || !timelineScrollInner || !timelineRulerInner) return;
 
@@ -5104,31 +5118,140 @@ function selectTimelineLayer(layerId) {
   updateTimelineLayerUI(layerId);
 }
 
-// Builds a single frame row for a layer
+function getLayerFrameMap(layerId) {
+  let m = keyframeStore.get(layerId);
+  if (!m) {
+    m = new Map();
+    keyframeStore.set(layerId, m);
+  }
+  return m;
+}
+
+function getLayerGroup(layerId) {
+  // your timeline layers are SVG groups: g[data-tl="layerId"]
+  return svg.querySelector(`g[data-tl="${layerId}"]`);
+}
+
+function isKeyframeUI(layerId, frameIndex) {
+  const row = timelineFrames.querySelector(`.frame-row[data-layer-id="${layerId}"]`);
+  if (!row) return false;
+  const cell = row.querySelector(`.frame-cell[data-frame="${frameIndex}"]`);
+  return !!cell?.querySelector(':scope > .frame-content-row');
+}
+
+function saveActiveLayerToKeyframe() {
+  const layerId = activeTimelineLayerId;     // use your real variable name
+  const frameIndex = currentFrame;
+
+  if (!isKeyframeUI(layerId, frameIndex)) return;
+
+  const g = getLayerGroup(layerId);
+  if (!g) return;
+
+  getLayerFrameMap(layerId).set(frameIndex, g.innerHTML);
+}
+
+function renderFrame(frameIndex) {
+  // clear selection/handles (no deselectAll)
+  selectedElement = null;
+  selectedElements = [];
+  activeAnchorIndex = null;
+  activeControlPoint = null;
+  draggingPath = null;
+  draggingAnchor = null;
+  isHandleDragging = false;
+  handleDrag = null;
+
+  clearControlPoints();
+
+  const layerGroups = svg.querySelectorAll('g[data-tl]');
+  layerGroups.forEach(g => {
+    const layerId = g.getAttribute('data-tl');
+    const frameMap = getLayerFrameMap(layerId);
+
+    if (isKeyframeUI(layerId, frameIndex)) {
+      g.innerHTML = frameMap.get(frameIndex) || '';
+    } else {
+      const prev = findPrevKeyframe(layerId, frameIndex);
+      g.innerHTML = (prev ? (frameMap.get(prev) || '') : '');
+    }
+  });
+
+  // optional: refresh selection visuals (will be empty now)
+  drawSelectionBoxes?.();
+}
+
+function findPrevKeyframe(layerId, frameIndex) {
+  for (let f = frameIndex; f >= 1; f--) {
+    if (isKeyframeUI(layerId, f)) return f;
+  }
+  return null;
+}
+
+function addBlankFrameAfterLast(layerId) {
+  const row = timelineFrames.querySelector(`.frame-row[data-layer-id="${layerId}"]`);
+  if (!row) return;
+
+  const cells = row.querySelectorAll('.frame-cell');
+  if (!cells.length) return;
+
+  // find last cell that already has frame-content-row
+  let lastIndex = -1;
+  for (let i = 0; i < cells.length; i++) {
+    if (cells[i].querySelector(':scope > .frame-content-row')) lastIndex = i;
+  }
+
+  // if none exist yet, treat frame 1 as start
+  if (lastIndex === -1) lastIndex = 0, addFrameContentRow(cells[0]);
+
+  const nextIndex = lastIndex + 1;
+
+  // reached end (frame 120 already filled)
+  if (nextIndex >= cells.length) return;
+
+  // add a blank frame marker to the next cell
+  addFrameContentRow(cells[nextIndex]);
+}
+
+function addBlankFrameAllLayers() {
+  const rows = timelineFrames.querySelectorAll('.frame-row');
+  rows.forEach(row => addBlankFrameAfterLast(row.dataset.layerId));
+}
+
+function addFrameContentRow(cell) {
+  // ✅ add only once (safe if called multiple times)
+  let inner = cell.querySelector(':scope > .frame-content-row');
+  if (inner) return inner;
+
+  inner = document.createElement('div');
+  inner.className = 'frame-content-row';
+  inner.style.width = '100%';
+  inner.style.height = '100%';
+  inner.style.position = 'relative';
+  cell.appendChild(inner);
+  return inner;
+}
+
+function makeFrameCell(i) {
+  const cell = document.createElement('div');
+  cell.className = 'frame-cell';
+  cell.style.width = frameWidth + 'px';
+  cell.dataset.frame = String(i);
+
+  if (i !== 1 && i % highlightStep === 0) cell.style.backgroundColor = '#777';
+  else cell.style.backgroundColor = '#525151';
+
+  if (i === 1) addFrameContentRow(cell);
+  return cell;
+}
+
 function buildFrameRow(layerId) {
   const row = document.createElement('div');
   row.className = 'frame-row';
   row.dataset.layerId = layerId;
 
   for (let i = 1; i <= totalFrames; i++) {
-    const cell = document.createElement('div');
-    cell.className = 'frame-cell';
-    cell.style.width = frameWidth + 'px';
-
-    if (i !== 1 && i % highlightStep === 0) cell.style.backgroundColor = '#777';
-    else cell.style.backgroundColor = '#525151';
-
-    // ✅ restore the inner block for frame 1 (the thing you were seeing)
-    if (i === 1) {
-      const frameContentRow = document.createElement('div');
-      frameContentRow.className = 'frame-content-row';
-      frameContentRow.style.width = '100%';
-      frameContentRow.style.height = '100%';
-      frameContentRow.style.position = 'relative';
-      cell.appendChild(frameContentRow);
-    }
-
-    row.appendChild(cell);
+    row.appendChild(makeFrameCell(i));
   }
 
   return row;
@@ -5294,6 +5417,7 @@ timelineRuler.addEventListener('click', (e) => {
   const idx = Math.floor(x / frameWidth) + 1;
 
   currentFrame = Math.max(1, Math.min(totalFrames, idx));
+  renderFrame(currentFrame);
   updatePlayhead();
 });
 
@@ -5311,6 +5435,7 @@ timelineFrames.addEventListener('click', (e) => {
   if (idx < 0) return;
 
   currentFrame = idx + 1;
+  renderFrame(currentFrame);
   updatePlayhead();
 });
 
@@ -5322,8 +5447,15 @@ function setFrameFromRulerClientX(clientX) {
   const x = localX + timelineHScroll.scrollLeft;
 
   const idx = Math.floor(x / frameWidth) + 1;
-  currentFrame = Math.max(1, Math.min(totalFrames, idx));
-  updatePlayhead();
+  const nextFrame = Math.max(1, Math.min(totalFrames, idx));
+
+  // ✅ only do work if frame changed
+  if (nextFrame === currentFrame) return;
+
+  currentFrame = nextFrame;
+
+  renderFrame(currentFrame);
+  updatePlayhead(); // ✅ keep UI in sync
 }
 
 // Click-to-jump + drag-to-scrub
