@@ -2,9 +2,101 @@
 /* --------------------------------- Variables --------------------------------- */
 /* ----------------------------------------------------------------------------- */
 const svg = document.getElementById('svgCanvas');
+const camera = document.getElementById('camera');
 const contextMenu = document.getElementById('contextMenu');
 
+/* ---- Selection rectangle ---- */
+const selectionLayer = document.getElementById('selectionLayer');
+const editLayer = document.getElementById('editLayer');
+
+/* ---- Grid ---- */
+const toggleGridBtn = document.getElementById('toggleGrid');
+const grid = document.getElementById('gridLayer');
+const gridCheck = document.getElementById('gridCheck');
+
+/* ---- Library ---- */
+const previewImg = document.getElementById('libraryPreviewImg');
+const previewSvg = document.getElementById('libraryPreviewSvg');
+const previewLabel = document.getElementById('libraryPreviewLabel');
+
+/* ---- Document stage ---- */
+const stageRect = document.getElementById('stageRect');
+
+/* ---- Ruler ---- */
+const rulerX = document.getElementById('rulerX');
+const rulerY = document.getElementById('rulerY');
+const toggleRulerBtn = document.getElementById('toggleRulers');
+const rulerCheck = document.getElementById('rulerCheck');
+const rulerBgLayer = document.getElementById('rulerBgLayer');
+
+/* ---- Canvar drawing ---- */
+const contentLayer = document.getElementById('contentLayer');
+
+/* ---- Undo / redo button ---- */
+const undoBtn = document.getElementById('undoBtn');
+const redoBtn = document.getElementById('redoBtn');
+const resetZoomBtn = document.getElementById('resetZoomBtn');
+
+/* ---- Left toolbar ---- */
+const transformTool = document.getElementById('transformTool');
+const editTool = document.getElementById('editTool');
+const rectangleTool = document.getElementById('rectangleTool');
+
+const deleteAnchorTool = document.getElementById('deleteAnchorTool');
+const addAnchorTool = document.getElementById('addAnchorTool');
+const joinAnchorTool = document.getElementById('joinAnchorTool');
+
+const splineTool = document.getElementById('splineTool');
+const ellipseTool = document.getElementById('ellipseTool');
+
+/* ---- Options panel ---- */
+const optionsPanel = document.getElementById('optionsPanel');
+const optionsPopout = document.getElementById('optionsPopout');
+
+/* ---- Inspector logic ---- */
+const inspectorEmpty = document.getElementById('inspectorEmpty');
+const inspectorPath = document.getElementById('inspectorPath');
+const strokeWidthInput = document.getElementById('strokeWidth');
+
 const NS = 'http://www.w3.org/2000/svg';
+
+let stage = {
+  x: 0,
+  y: 0,
+  width: 800,
+  height: 600
+};
+
+let drawing = false;
+let path = null;
+
+let rectDrawing = false;
+let rectStart = null;
+let currentRect = null;
+
+let panning = false;
+let panStart = null;
+let camStart = null;
+
+let selectedElement = null;
+let selectionRect = null;
+let selectedElements = [];
+let startTransforms = new Map();
+
+let isDragging = false;
+let dragStart = null;
+let draggingAnchor = null;
+let draggingPath = null;
+let startTranslate = { x: 0, y: 0 };
+
+let ellipseDrawing = false;
+let ellipseStart = null;
+let currentEllipse = null;
+
+let gridVisible = false;
+let rulerVisible = true;
+
+let activeTool = 'transform'; // transform | edit | draw
 
 let draggedLayerId = null;
 let isRenamingLayer = false;
@@ -21,12 +113,9 @@ let activeAnchorIndex = null;
 let selectedAnchorPath = null;
 let selectedAnchorIndex = null;
 
-const MIN_DRAW_DISTANCE = 32; // tweak: 4–8 feels good
-
 // History stacks
 let undoStack = [];
 let redoStack = [];
-const MAX_HISTORY = 50; // limit for memory
 
 let ignoreDeselect = false;
 
@@ -36,6 +125,13 @@ let handleDrag = null; // stores drag state
 // Object rotation
 let isRotateDragging = false;
 let rotateDrag = null;
+
+const BASE_GRID_SIZE = 25;   // Boxy-like
+const MAJOR_STEP = 5;
+const RULER_SIZE = 20;
+const RULER_STEP = 50; // same feel as Boxy
+const MIN_DRAW_DISTANCE = 32; // tweak: 4–8 feels good
+const MAX_HISTORY = 50; // limit for memory
 
 // -------------------- DOC HISTORY --------------------
 let nextUID = 1;
@@ -122,10 +218,6 @@ function setLibrarySelection(assetId) {
 /* ----------------------------------------------------------------------------- */
 /* -------------------------------- Library preview ---------------------------- */
 /* ----------------------------------------------------------------------------- */
-const previewImg = document.getElementById('libraryPreviewImg');
-const previewSvg = document.getElementById('libraryPreviewSvg');
-const previewLabel = document.getElementById('libraryPreviewLabel');
-
 function clearLibraryPreview() {
   previewImg.src = "";
   previewImg.style.display = "none";
@@ -560,7 +652,6 @@ function ensurePointsModel(path, forceRebuild = false) {
     }
   });
 
-  // BUG: Rectangle double anchor at start point 
   // ✅ If path ends with Z, add an explicit closing cubic segment
   // so the "last segment" has real handles in edit mode.
   if (path.__closed && pts.length > 1) {
@@ -580,7 +671,7 @@ function ensurePointsModel(path, forceRebuild = false) {
       pts.push({ type: 'C', c1x: c1x, c1y: c1y, c2x: c2x, c2y: c2y, x: sx, y: sy });
 
       // update cursor (not required, but keeps state consistent)
-      //cursorX = sx; cursorY = sy;
+      cursorX = sx; cursorY = sy;
     }
   }
 
@@ -1407,8 +1498,6 @@ function snapAnchorsIfClose(path, clickedIndex) {
 /* ----------------------------------------------------------------------------- */
 /* ----------------------------- Camera zoom limit ----------------------------- */
 /* ----------------------------------------------------------------------------- */
-const camera = document.getElementById('camera');
-
 let camX = 0;
 let camY = 0;
 let camScale = 1;
@@ -1443,15 +1532,6 @@ function updateCamera() {
 /* ----------------------------------------------------------------------------- */
 /* ------------------------------ Document Stage -------------------------------- */
 /* ----------------------------------------------------------------------------- */
-const stageRect = document.getElementById('stageRect');
-
-let stage = {
-  x: 0,
-  y: 0,
-  width: 800,
-  height: 600
-};
-
 function updateStage() {
   stageRect.setAttribute('x', stage.x);
   stageRect.setAttribute('y', stage.y);
@@ -2082,12 +2162,6 @@ async function saveCanvas(canvas) {
 /* ----------------------------------------------------------------------------- */
 /* ------------------------------ Grid rulers ---------------------------------- */
 /* ----------------------------------------------------------------------------- */
-const rulerX = document.getElementById('rulerX');
-const rulerY = document.getElementById('rulerY');
-
-const RULER_SIZE = 20;
-const RULER_STEP = 50; // same feel as Boxy
-
 function drawRulers() {
   const contentX = rulerX.querySelector('.ruler-content') || rulerX;
   const contentY = rulerY.querySelector('.ruler-content') || rulerY;
@@ -2155,15 +2229,6 @@ function drawRulers() {
 }
 
 /*-------- Toggle grid ----------*/
-const toggleGridBtn = document.getElementById('toggleGrid');
-const grid = document.getElementById('gridLayer');
-const gridCheck = document.getElementById('gridCheck');
-
-let gridVisible = false;
-
-const BASE_GRID_SIZE = 25;   // Boxy-like
-const MAJOR_STEP = 5;
-
 // initial state
 grid.style.display = 'none';
 gridCheck.style.visibility = 'hidden';
@@ -2188,12 +2253,6 @@ toggleGridBtn.addEventListener('click', e => {
 });
 
 /*-------- Toggle ruler ----------*/
-const toggleRulerBtn = document.getElementById('toggleRulers');
-const rulerCheck = document.getElementById('rulerCheck');
-const rulerBgLayer = document.getElementById('rulerBgLayer');
-
-let rulerVisible = true;
-
 // initial state
 rulerCheck.textContent = '✓';
 rulerCheck.style.visibility = 'visible';
@@ -2288,10 +2347,6 @@ function drawGrid() {
 }
 
 /* ---- Toolbar actions ---- */
-const undoBtn = document.getElementById('undoBtn');
-const redoBtn = document.getElementById('redoBtn');
-const resetZoomBtn = document.getElementById('resetZoomBtn');
-
 undoBtn.onclick = () => {
   console.log('Undo');
   undo();
@@ -2318,19 +2373,6 @@ resetZoomBtn.addEventListener('click', resetZoom);
 /* ----------------------------------------------------------------------------- */
 /* ---------------------------- Left toolbar actions --------------------------- */
 /* ----------------------------------------------------------------------------- */
-const transformTool = document.getElementById('transformTool');
-const editTool = document.getElementById('editTool');
-const rectangleTool = document.getElementById('rectangleTool');
-
-const deleteAnchorTool = document.getElementById('deleteAnchorTool');
-const addAnchorTool = document.getElementById('addAnchorTool');
-const joinAnchorTool = document.getElementById('joinAnchorTool');
-
-const splineTool = document.getElementById('splineTool');
-const ellipseTool = document.getElementById('ellipseTool');
-
-let activeTool = 'transform'; // transform | edit | draw
-
 function setActiveTool(tool, toolName) {
   // 🔄 reset cursor FIRST
   svg.classList.remove(
@@ -2433,19 +2475,6 @@ ellipseTool.onclick = () => {
 /* ----------------------------------------------------------------------------- */
 /* ----------------------------- Canvas drawing -------------------------------- */
 /* ----------------------------------------------------------------------------- */
-const contentLayer = document.getElementById('contentLayer');
-
-let drawing = false;
-let path = null;
-
-let rectDrawing = false;
-let rectStart = null;
-let currentRect = null;
-
-let panning = false;
-let panStart = null;
-let camStart = null;
-
 function getSVGPoint(evt) {
   const pt = svg.createSVGPoint();
   pt.x = evt.clientX;
@@ -3087,24 +3116,6 @@ function selectByMarquee(additive = false) {
 /* ----------------------------------------------------------------------------- */
 /* ---------------------------- Selection rectangle ---------------------------- */
 /* ----------------------------------------------------------------------------- */
-const selectionLayer = document.getElementById('selectionLayer');
-const editLayer = document.getElementById('editLayer');
-
-let selectedElement = null;
-let selectionRect = null;
-let selectedElements = [];
-let startTransforms = new Map();
-
-let isDragging = false;
-let dragStart = null;
-let draggingAnchor = null;
-let draggingPath = null;
-let startTranslate = { x: 0, y: 0 };
-
-let ellipseDrawing = false;
-let ellipseStart = null;
-let currentEllipse = null;
-
 function selectElement(el, additive = false) {
   if (!additive) {
     clearSelection();
@@ -3322,12 +3333,6 @@ function sendBackward() {
 /* ----------------------------------------------------------------------------- */
 /* ------------------------------ Inspector logic ------------------------------ */
 /* ----------------------------------------------------------------------------- */
-const inspectorEmpty = document.getElementById('inspectorEmpty');
-
-const inspectorPath = document.getElementById('inspectorPath');
-
-const strokeWidthInput = document.getElementById('strokeWidth');
-
 strokeWidthInput.addEventListener('pointerdown', () => {
   if (selectedElement) snapshotDocHistory();
 });
@@ -4187,7 +4192,7 @@ function drawControlPoints(path) {
     return;
   }
 
-  //ensurePointsModel(path);
+  ensurePointsModel(path);
 
   // ✅ Build editable point model ONLY ONCE
   if (!path.__points) {
@@ -4969,9 +4974,6 @@ window.addEventListener('keydown', e => {
 /* ----------------------------------------------------------------------------- */
 /* -------------------------- Options panel pop-out ---------------------------- */
 /* ----------------------------------------------------------------------------- */
-const optionsPanel = document.getElementById('optionsPanel');
-const optionsPopout = document.getElementById('optionsPopout');
-
 optionsPopout.addEventListener('click', () => {
   optionsPanel.classList.toggle('collapsed');
 
