@@ -1533,3 +1533,206 @@ html, body{
 #optionsPanel .cp-mini:hover{
   border-color: rgba(77,163,255,0.35) !important;
 }
+
+/* ===========================================================
+   PREMIUM COLOR PASS (SAFE)
+   - no layout changes (no flex/position/width/height)
+   - only visuals: gradients, shadows, borders, text color
+   Paste at END of index.css
+   =========================================================== */
+
+/* More lively accents (still professional) */
+:root{
+  --accentA: #4da3ff;   /* blue */
+  --accentB: #a855f7;   /* purple */
+  --accentC: #22c55e;   /* green (small use) */
+  --warm:    #ffb23f;   /* orange */
+  --glass:   rgba(255,255,255,0.06);
+  --glass2:  rgba(255,255,255,0.10);
+  --edge:    rgba(255,255,255,0.12);
+}
+
+/* subtle “aurora” glow behind app */
+#app{
+  background:
+    radial-gradient(900px 420px at 20% 0%, rgba(77,163,255,0.12), transparent 60%),
+    radial-gradient(900px 420px at 90% 10%, rgba(168,85,247,0.10), transparent 60%),
+    linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.10)),
+    linear-gradient(180deg, #121826, #0f141e) !important;
+}
+
+/* Make top bars feel “premium” with thin colored highlight line */
+.menu-bar,
+.toolbar{
+  position: relative;
+}
+.menu-bar::after,
+.toolbar::after{
+  content:"";
+  display:block;
+  height:1px;
+  background: linear-gradient(90deg, rgba(77,163,255,0.65), rgba(168,85,247,0.50), transparent 70%);
+  opacity: 0.85;
+}
+
+/* Dropdown menu: slightly more contrast + soft blur feel */
+.dropdown{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.07), rgba(0,0,0,0.22)),
+    linear-gradient(180deg, #1b2332, #111827) !important;
+  border-color: rgba(255,255,255,0.14) !important;
+}
+
+/* Buttons: add “neon edge” only on hover/active */
+.tool-btn:hover{
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.10),
+    0 0 0 1px rgba(77,163,255,0.18),
+    0 10px 26px rgba(0,0,0,0.45) !important;
+}
+.tool-btn.active{
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.10),
+    0 0 0 1px rgba(77,163,255,0.24),
+    0 0 22px rgba(77,163,255,0.18),
+    0 12px 30px rgba(0,0,0,0.48) !important;
+}
+
+/* Left toolbar: tiny inner highlight for depth */
+.left-toolbar{
+  box-shadow:
+    inset -1px 0 0 rgba(255,255,255,0.05),
+    inset 0 1px 0 rgba(255,255,255,0.05) !important;
+}
+
+/* ---------------- Options panel: make it “inspector-card” style ---------------- */
+#optionsPanel{
+  background:
+    radial-gradient(900px 420px at 50% 0%, rgba(77,163,255,0.08), transparent 55%),
+    radial-gradient(700px 420px at 90% 0%, rgba(168,85,247,0.07), transparent 60%),
+    linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.18)),
+    linear-gradient(180deg, #151c29, #0f141e) !important;
+  border-left: 1px solid rgba(255,255,255,0.10) !important;
+  box-shadow:
+    inset 1px 0 0 rgba(255,255,255,0.05),
+    inset 0 1px 0 rgba(255,255,255,0.05) !important;
+}
+
+.options-header{
+  background:
+    linear-gradient(90deg, rgba(77,163,255,0.10), rgba(168,85,247,0.08), rgba(0,0,0,0.10)),
+    linear-gradient(180deg, #1b2332, #141b26) !important;
+  border-bottom: 1px solid rgba(255,255,255,0.12) !important;
+}
+
+/* Inspector groups look like real “cards” */
+#optionsPanel .inspector-group{
+  border: 1px solid rgba(255,255,255,0.12) !important;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.20)) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.06),
+    0 14px 34px rgba(0,0,0,0.28) !important;
+}
+
+/* Inputs in options: glassy */
+#optionsPanel input[type="number"],
+#optionsPanel input[type="text"],
+#optionsPanel select{
+  background: rgba(0,0,0,0.30) !important;
+  border: 1px solid rgba(255,255,255,0.14) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
+#optionsPanel input:focus,
+#optionsPanel select:focus{
+  border-color: rgba(77,163,255,0.55) !important;
+  box-shadow:
+    0 0 0 3px rgba(77,163,255,0.18),
+    0 0 18px rgba(168,85,247,0.10),
+    inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
+
+/* ---------------- Layers panel: match options richness ---------------- */
+#layersPanel{
+  background:
+    radial-gradient(800px 360px at 40% 0%, rgba(168,85,247,0.07), transparent 58%),
+    linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.18)),
+    linear-gradient(180deg, #151c29, #0f141e) !important;
+  box-shadow:
+    inset 1px 0 0 rgba(255,255,255,0.05) !important;
+}
+
+/* Selected layer: colorful bar */
+.layer-item.selected{
+  background: linear-gradient(90deg, rgba(77,163,255,0.22), rgba(168,85,247,0.14)) !important;
+  box-shadow: inset 0 0 0 1px rgba(77,163,255,0.22) !important;
+}
+
+/* ---------------- Timeline: make it look “alive” ---------------- */
+#timelinePanel{
+  background:
+    radial-gradient(900px 320px at 30% 0%, rgba(77,163,255,0.08), transparent 60%),
+    radial-gradient(900px 320px at 80% 0%, rgba(168,85,247,0.07), transparent 62%),
+    linear-gradient(180deg, #151c29, #0f141e) !important;
+}
+
+#timelineHeader,
+#timelineRuler,
+#timelineLayersLabel{
+  background:
+    linear-gradient(90deg, rgba(77,163,255,0.08), rgba(168,85,247,0.06), rgba(0,0,0,0.12)),
+    linear-gradient(180deg, #1b2332, #141b26) !important;
+}
+
+.frame-cell{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.10)) !important;
+}
+
+.frame-content-row.has-content{
+  background:
+    linear-gradient(180deg, rgba(77,163,255,1), rgba(46,138,255,1)) !important;
+  box-shadow:
+    inset 0 0 0 1px rgba(255,255,255,0.22),
+    0 10px 22px rgba(77,163,255,0.16) !important;
+}
+
+/* Keyframes: warm pop */
+.frame-cell.keyframe{
+  background: linear-gradient(180deg, #ffc24f, #f08a00) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.30),
+    0 8px 18px rgba(255,178,63,0.12) !important;
+}
+
+/* Playhead: stronger “pro” glow */
+#playhead{
+  box-shadow:
+    0 0 0 1px rgba(0,0,0,0.40),
+    0 0 26px rgba(255,59,48,0.22),
+    0 0 10px rgba(255,59,48,0.18) !important;
+}
+
+/* ---------------- Canvas / stage: more cinematic ---------------- */
+/* keep your stageRect fill if you rely on white; this just adds border depth */
+#stageRect{
+  stroke: rgba(255,255,255,0.14) !important;
+  filter: drop-shadow(0 18px 26px rgba(0,0,0,0.25));
+}
+
+/* Context menu: neon hover */
+.context-item:hover,
+.item:hover{
+  background: linear-gradient(90deg, rgba(77,163,255,0.18), rgba(168,85,247,0.14)) !important;
+}
+
+/* Scrollbar: nicer thumb */
+::-webkit-scrollbar-thumb{
+  background:
+    linear-gradient(180deg, rgba(77,163,255,0.25), rgba(168,85,247,0.20)) !important;
+  border-radius: 999px !important;
+}
+::-webkit-scrollbar-thumb:hover{
+  background:
+    linear-gradient(180deg, rgba(77,163,255,0.32), rgba(168,85,247,0.26)) !important;
+}
