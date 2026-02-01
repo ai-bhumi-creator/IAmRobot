@@ -3,8 +3,6 @@
 /* ----------------------------------------------------------------------------- */
 const svg = document.getElementById('svgCanvas');
 const contextMenu = document.getElementById('contextMenu');
-const contentLayer = document.getElementById('contentLayer');
-const camera = document.getElementById('camera');
 
 const NS = 'http://www.w3.org/2000/svg';
 
@@ -22,28 +20,6 @@ let activeAnchorIndex = null;
 
 let selectedAnchorPath = null;
 let selectedAnchorIndex = null;
-
-let drawing = false;
-let path = null;
-
-let rectDrawing = false;
-let rectStart = null;
-let currentRect = null;
-
-let panning = false;
-let panStart = null;
-let camStart = null;
-
-let tempRect = null;
-let isDrawingRect = false;
-
-// Camera/pan variables (add these near your other variables like rectStart)
-let camX = 0;
-let camY = 0;
-let camScale = 1;
-
-const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 10;
 
 const MIN_DRAW_DISTANCE = 32; // tweak: 4–8 feels good
 
@@ -1431,6 +1407,15 @@ function snapAnchorsIfClose(path, clickedIndex) {
 /* ----------------------------------------------------------------------------- */
 /* ----------------------------- Camera zoom limit ----------------------------- */
 /* ----------------------------------------------------------------------------- */
+const camera = document.getElementById('camera');
+
+let camX = 0;
+let camY = 0;
+let camScale = 1;
+
+const MIN_ZOOM = 0.5;
+const MAX_ZOOM = 10;
+
 function updateCamera() {
   camera.setAttribute('transform', `translate(${camX}, ${camY}) scale(${camScale})`);
 
@@ -2448,27 +2433,28 @@ ellipseTool.onclick = () => {
 /* ----------------------------------------------------------------------------- */
 /* ----------------------------- Canvas drawing -------------------------------- */
 /* ----------------------------------------------------------------------------- */
-function getSVGPoint(clientX, clientY) {
-    const pt = svg.createSVGPoint();
-    pt.x = clientX;
-    pt.y = clientY;
-    
-    try {
-        // Get the transform from screen to SVG coordinates
-        const ctm = svg.getScreenCTM();
-        if (!ctm) return { x: clientX, y: clientY };
-        
-        const invertedCTM = ctm.inverse();
-        const svgPt = pt.matrixTransform(invertedCTM);
-        
-        return {
-            x: Number.isFinite(svgPt.x) ? svgPt.x : 0,
-            y: Number.isFinite(svgPt.y) ? svgPt.y : 0
-        };
-    } catch (e) {
-        // Fallback if transform fails
-        return { x: clientX, y: clientY };
-    }
+const contentLayer = document.getElementById('contentLayer');
+
+let drawing = false;
+let path = null;
+
+let rectDrawing = false;
+let rectStart = null;
+let currentRect = null;
+
+let panning = false;
+let panStart = null;
+let camStart = null;
+
+function getSVGPoint(evt) {
+  const pt = svg.createSVGPoint();
+  pt.x = evt.clientX;
+  pt.y = evt.clientY;
+
+  const screenCTM = svg.getScreenCTM();
+  const camCTM = camera.getCTM();
+
+  return pt.matrixTransform(screenCTM.inverse()).matrixTransform(camCTM.inverse());
 }
 
 function handleDrawStart(e) {
@@ -2503,174 +2489,81 @@ function handleDrawStart(e) {
   // ❌ Do NOT call updateLayersPanel() yet
 }
 
-function createRectanglePath(x, y, width, height) {
-    snapshotDocHistory();
-    
-    const layerGroup = getActiveLayerGroup();
-    if (!layerGroup) return null;
-    
-    // Create as path (not rect) to work with anchor system
-    const path = document.createElementNS(NS, 'path');
-    ensureUID(path);
-    
-    // Path data - CRITICAL: Only 4 points, closed with Z
-    const pathData = 
-        `M ${x} ${y} ` +                    // Move to start
-        `L ${x + width} ${y} ` +            // Line to top-right
-        `L ${x + width} ${y + height} ` +   // Line to bottom-right
-        `L ${x} ${y + height} Z`;           // Line to bottom-left and CLOSE
-    
-    path.setAttribute('d', pathData);
-    path.setAttribute('fill', 'none');
-    path.setAttribute('stroke', '#000');
-    path.setAttribute('stroke-width', '2');
-    path.setAttribute('data-shape-type', 'rectangle');
-    path.setAttribute('data-layer-name', `Rectangle ${Date.now()}`);
-    
-    // Apply styling
-    applyNonScalingStroke(path);
-    
-    // Store rectangle data
-    path.rectData = { x, y, width, height };
-    
-    // Add to layer
-    layerGroup.appendChild(path);
-    
-    // Initialize anchors WITHOUT creating duplicates
-    initRectangleAnchors(path, x, y, width, height);
-    
-    // Select it
-    clearSelection();
-    selectedElement = path;
-    selectedElements = [path];
-    
-    updateInspector();
-    updateLayersPanel();
-    
-    return path;
+function handleRectangleStart(e) {
+  snapshotDocHistory();
+
+  rectDrawing = true;
+  rectStart = getSVGPoint(e);
+
+  // ✅ create PATH (not RECT)
+  currentRect = document.createElementNS(NS, 'path');
+
+  setIsLayer(currentRect, false);
+  ensureUID(currentRect);
+
+  // default style (same as your old rect)
+  currentRect.setAttribute('fill', 'none');
+  currentRect.setAttribute('stroke', '#000');
+  currentRect.setAttribute('stroke-width', '2');
+  applyNonScalingStroke(currentRect);
+  currentRect.setAttribute('stroke-linecap', 'round');
+  currentRect.setAttribute('stroke-linejoin', 'round');
+
+  // initial tiny rectangle path
+  currentRect.setAttribute('d', rectPathD(rectStart.x, rectStart.y, 0, 0));
+  currentRect.__closed = true;
+
+  // ✅ append so we can see it while dragging
+  getActiveLayerGroup().appendChild(currentRect);
+
+  // track for later symbol conversion
+  newElements.push(currentRect);
+
+  // do NOT add to layer panel unless it’s symbol (your system)
+  // updateLayersPanel();  // keep off if you want
 }
 
-function initRectangleAnchors(path, x, y, width, height) {
-    if (!path || typeof ensurePointsModel !== 'function') return;
-    
-    // Create the 4 corner points
-    const corners = [
-        { x: x, y: y },                     // top-left
-        { x: x + width, y: y },             // top-right
-        { x: x + width, y: y + height },    // bottom-right
-        { x: x, y: y + height }             // bottom-left
-    ];
-    
-    // Initialize anchor points array
-    path._anchorPoints = [];
-    
-    // Add only 4 corner anchors (no midpoints, no duplicates)
-    for (let i = 0; i < 4; i++) {
-        path._anchorPoints.push({
-            point: corners[i],
-            in: { x: 0, y: 0 },
-            out: { x: 0, y: 0 },
-            corner: true,
-            index: i
-        });
-    }
-    
-    // Call ensurePointsModel but limit its modifications
-    ensurePointsModel(path);
-    
-    // SAFEGUARD: If too many anchors were created, trim to 4
-    if (path._anchorPoints && path._anchorPoints.length > 4) {
-        console.warn('Trimming excess anchors from', path._anchorPoints.length, 'to 4');
-        path._anchorPoints = path._anchorPoints.slice(0, 4);
-    }
+function handleRectangleMove(e) {
+  if (!rectDrawing || !currentRect || !rectStart) return;
+
+  const pt = getSVGPoint(e);
+  setPathRectFromPoints(currentRect, rectStart, pt);
 }
 
-function cleanupRectangleDrawing() {
-    if (tempRect && tempRect.parentNode) {
-        tempRect.parentNode.removeChild(tempRect);
-    }
-    rectStart = null;
-    tempRect = null;
-    isDrawingRect = false;
-}
+function handleRectangleEnd(e) {
+  if (!rectDrawing || !currentRect) return;
 
-function handleRectangleStart(clientX, clientY) {
-    // Convert to valid SVG coordinates
-    const startPoint = getSVGPoint(clientX, clientY);
-    
-    // Clear any previous temporary rectangle
-    if (tempRect && tempRect.parentNode) {
-        tempRect.parentNode.removeChild(tempRect);
-        tempRect = null;
-    }
-    
-    // Store starting point
-    rectStart = { x: startPoint.x, y: startPoint.y };
-    isDrawingRect = true;
-    
-    // Create temporary rectangle
-    tempRect = document.createElementNS(NS, 'rect');
-    tempRect.setAttribute('x', startPoint.x.toString());
-    tempRect.setAttribute('y', startPoint.y.toString());
-    tempRect.setAttribute('width', '0');
-    tempRect.setAttribute('height', '0');
-    tempRect.setAttribute('fill', 'none');
-    tempRect.setAttribute('stroke', '#000');
-    tempRect.setAttribute('stroke-width', '2');
-    tempRect.setAttribute('stroke-dasharray', '5,5');
-    tempRect.classList.add('temp-element');
-    
-    // Add to a preview layer or directly to svg
-    const previewLayer = document.getElementById('previewLayer') || svg;
-    previewLayer.appendChild(tempRect);
-    
-    return true;
-}
+  // finalize one last time
+  handleRectangleMove(e);
 
-function handleRectangleMove(clientX, clientY) {
-    if (!rectStart || !tempRect || !isDrawingRect) return;
-    
-    // Convert to valid SVG coordinates
-    const currentPoint = getSVGPoint(clientX, clientY);
-    
-    // Calculate rectangle dimensions
-    const x = Math.min(rectStart.x, currentPoint.x);
-    const y = Math.min(rectStart.y, currentPoint.y);
-    const width = Math.abs(currentPoint.x - rectStart.x);
-    const height = Math.abs(currentPoint.y - rectStart.y);
-    
-    // Update temporary rectangle - USE EXPLICIT NUMBERS
-    tempRect.setAttribute('x', x.toString());
-    tempRect.setAttribute('y', y.toString());
-    tempRect.setAttribute('width', width.toString());
-    tempRect.setAttribute('height', height.toString());
-}
+  const w = currentRect.__rectW || 0;
+  const h = currentRect.__rectH || 0;
 
-function handleRectangleEnd(clientX, clientY) {
-    if (!rectStart || !isDrawingRect) return;
-    
-    // Convert to valid SVG coordinates
-    const endPoint = getSVGPoint(clientX, clientY);
-    
-    // Calculate final rectangle
-    const x = Math.min(rectStart.x, endPoint.x);
-    const y = Math.min(rectStart.y, endPoint.y);
-    const width = Math.abs(endPoint.x - rectStart.x);
-    const height = Math.abs(endPoint.y - rectStart.y);
-    
-    // Skip if too small
-    if (width < 2 || height < 2) {
-        cleanupRectangleDrawing();
-        return;
+  const MIN_SIZE = 2 / camScale;
+  if (w < MIN_SIZE || h < MIN_SIZE) {
+    currentRect.remove();
+  } else {
+    // ✅ build points model NOW so anchor tools work immediately
+    // Path is: M -> L -> L -> L -> Z, so we store 4 points (M + 3 L)
+    const d = currentRect.getAttribute('d');
+    const nums = d.match(/-?\d+(\.\d+)?/g)?.map(Number) || [];
+    // nums: [x,y, x2,y2, x3,y3, x4,y4]
+    if (nums.length >= 8) {
+      currentRect.__points = [
+        { type: 'M', x: nums[0], y: nums[1] },
+        { type: 'L', x: nums[2], y: nums[3] },
+        { type: 'L', x: nums[4], y: nums[5] },
+        { type: 'L', x: nums[6], y: nums[7] }
+      ];
     }
-    
-    // Create final rectangle as PATH (not rect element)
-    const rectPath = createRectanglePath(x, y, width, height);
-    
-    // Clean up temporary rectangle
-    cleanupRectangleDrawing();
-    
-    return true;
+
+    // switch to transform + select
+    selectElement(currentRect, false);
+  }
+
+  rectDrawing = false;
+  rectStart = null;
+  currentRect = null;
 }
 
 function handleTransformStart(e) {
@@ -2873,7 +2766,7 @@ document.addEventListener('DOMContentLoaded', () => {
     if (activeTool === 'delete-anchor' && editLayerTarget) return;
 
     if (activeTool === 'rectangle') {
-      handleRectangleStart(e.clientX, e.clientY);
+      handleRectangleStart(e);
       return;
     }
 
@@ -2905,20 +2798,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 
   svg.addEventListener('mousemove', e => {
-    if (activeTool === 'rectangle' && isDrawingRect) {
-        handleRectangleMove(e.clientX, e.clientY);
-    }
-
     if (activeTool === 'spline') {
       handleSplineMouseMove(e);
       return;
     }
-  });
-
-  svg.addEventListener('mouseup', (e) => {
-      if (activeTool === 'rectangle' && isDrawingRect) {
-          handleRectangleEnd(e.clientX, e.clientY);
-      }
   });
 
   svg.addEventListener('pointerup', e => {
