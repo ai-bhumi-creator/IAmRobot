@@ -5486,11 +5486,20 @@ function createTimelineLayer(name) {
   });
 
   // clicking the row selects the layer
-  layerDiv.addEventListener('click', () => {
+  layerDiv.addEventListener('click', (e) => {
+    if (isRenamingLayer) return;
     // optional: don’t allow selecting a locked timeline layer
     // if (isTimelineLayerLocked(layerId)) return;
     selectTimelineLayer(layerId);
   });
+
+// ✅ right-click menu (like Library): Rename / Delete
+layerDiv.addEventListener('contextmenu', (e) => {
+  e.preventDefault();
+  e.stopPropagation(); // prevent your document-level context menu
+  selectTimelineLayer(layerId);
+  showTimelineLayerMenu(e.clientX, e.clientY, layerId);
+});
 
   layerDiv.appendChild(nameSpan);
   layerDiv.appendChild(eye);
@@ -5859,3 +5868,141 @@ stepFrontBtn.onclick = () => {
   // optional if you have it:
   // ensurePlayheadVisible();
 };
+
+/* ----------------------------------------------------------------------------- */
+/* ------------------ Timeline layer right-click menu (rename/delete) ----------- */
+/* ----------------------------------------------------------------------------- */
+let tlMenuEl = null;
+let tlMenuLayerId = null;
+
+function ensureTimelineLayerMenu() {
+  if (tlMenuEl) return tlMenuEl;
+
+  tlMenuEl = document.createElement('div');
+  tlMenuEl.id = 'timelineLayerContextMenu';
+  tlMenuEl.style.position = 'fixed';
+  tlMenuEl.style.zIndex = '999999';
+  tlMenuEl.style.minWidth = '160px';
+  tlMenuEl.style.padding = '6px';
+  tlMenuEl.style.borderRadius = '8px';
+  tlMenuEl.style.border = '1px solid rgba(255,255,255,0.12)';
+  tlMenuEl.style.background = 'rgba(20,20,20,0.95)';
+  tlMenuEl.style.backdropFilter = 'blur(6px)';
+  tlMenuEl.style.boxShadow = '0 8px 24px rgba(0,0,0,0.35)';
+  tlMenuEl.style.display = 'none';
+
+  tlMenuEl.innerHTML = `
+    <div class="tlctx-item" data-act="rename" style="padding:8px 10px; border-radius:6px; cursor:pointer; color:white;">Rename</div>
+    <div style="height:1px; margin:6px 0; background:rgba(255,255,255,0.10);"></div>
+    <div class="tlctx-item" data-act="delete" style="padding:8px 10px; border-radius:6px; cursor:pointer; color:white;">Delete</div>
+  `;
+
+  tlMenuEl.addEventListener('mouseover', (e) => {
+    const it = e.target.closest('.tlctx-item');
+    if (it) it.style.background = 'rgba(255,255,255,0.08)';
+  });
+  tlMenuEl.addEventListener('mouseout', (e) => {
+    const it = e.target.closest('.tlctx-item');
+    if (it) it.style.background = 'transparent';
+  });
+
+  tlMenuEl.addEventListener('mousedown', (e) => {
+    // prevent menu click from closing immediately via document handler
+    e.stopPropagation();
+  });
+
+  tlMenuEl.addEventListener('click', (e) => {
+    const item = e.target.closest('.tlctx-item');
+    if (!item) return;
+
+    const act = item.dataset.act;
+    const layerId = tlMenuLayerId;
+
+    hideTimelineLayerMenu();
+    if (!layerId) return;
+
+    if (act === 'rename') beginTimelineLayerInlineRename(layerId);
+    if (act === 'delete') removeTimelineLayer(layerId);
+  });
+
+  document.body.appendChild(tlMenuEl);
+
+  // close on outside click / escape / scroll / resize
+  document.addEventListener('mousedown', () => hideTimelineLayerMenu());
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape') hideTimelineLayerMenu(); }, true);
+  window.addEventListener('scroll', hideTimelineLayerMenu, true);
+  window.addEventListener('resize', hideTimelineLayerMenu);
+
+  return tlMenuEl;
+}
+
+function showTimelineLayerMenu(x, y, layerId) {
+  const m = ensureTimelineLayerMenu();
+  tlMenuLayerId = layerId;
+
+  m.style.display = 'block';
+
+  // keep inside viewport
+  const pad = 6;
+  const rect = m.getBoundingClientRect();
+  const maxX = window.innerWidth - rect.width - pad;
+  const maxY = window.innerHeight - rect.height - pad;
+  m.style.left = Math.max(pad, Math.min(x, maxX)) + 'px';
+  m.style.top = Math.max(pad, Math.min(y, maxY)) + 'px';
+}
+
+function hideTimelineLayerMenu() {
+  if (!tlMenuEl) return;
+  tlMenuEl.style.display = 'none';
+  tlMenuLayerId = null;
+}
+
+function beginTimelineLayerInlineRename(layerId) {
+  if (!layerId) return;
+
+  const row = timelineLayers?.querySelector(`.timeline-layer[data-layer-id="${layerId}"]`);
+  const nameEl = row?.querySelector('.tl-name');
+  if (!nameEl) return;
+
+  const oldName = nameEl.textContent || '';
+
+  isRenamingLayer = true;
+  nameEl.contentEditable = 'true';
+  nameEl.classList.add('editing');
+  nameEl.focus();
+
+  const sel = window.getSelection();
+  sel.removeAllRanges();
+  const range = document.createRange();
+  range.selectNodeContents(nameEl);
+  sel.addRange(range);
+
+  const cleanup = () => {
+    nameEl.contentEditable = 'false';
+    nameEl.classList.remove('editing');
+    nameEl.onkeydown = null;
+    nameEl.onblur = null;
+    isRenamingLayer = false;
+  };
+
+  nameEl.onkeydown = (e) => {
+    if (e.key === 'Enter') { e.preventDefault(); nameEl.blur(); }
+    if (e.key === 'Escape') {
+      e.preventDefault();
+      nameEl.textContent = oldName;
+      nameEl.blur();
+    }
+  };
+
+  nameEl.onblur = () => {
+    const newName = nameEl.textContent.trim();
+    nameEl.textContent = newName || oldName || 'Layer';
+
+    // optional: persist name on dataset/SVG group (harmless if unused)
+    row.dataset.layerName = nameEl.textContent;
+    const g = ensureTimelineSVGGroup?.(layerId);
+    if (g) g.dataset.layerName = nameEl.textContent;
+
+    cleanup();
+  };
+}
