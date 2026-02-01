@@ -63,8 +63,8 @@ const NS = 'http://www.w3.org/2000/svg';
 let stage = {
   x: 0,
   y: 0,
-  width: 800,
-  height: 600
+  width: 1920,
+  height: 1080
 };
 
 let drawing = false;
@@ -1958,6 +1958,15 @@ document.getElementById('exportImage').onclick = () => {
   exportImage();
 };
 
+document.getElementById('exportPNGSequence').onclick = async () => {
+  closeContextMenu?.();
+
+  // stop playback if running
+  if (typeof stopTimelinePlayback === 'function') stopTimelinePlayback();
+
+  await exportPNGSequence({ scale: 1 }); // scale can be 1, 2, etc.
+};
+
 /* ----------------------------------------------------------------------------- */
 /* ------------------------------- Context menu -------------------------------- */
 /* ----------------------------------------------------------------------------- */
@@ -2112,6 +2121,159 @@ function exportImage(scale = 1) {
   };
 
   img.src = url;
+}
+
+async function exportPNGSequence({ scale = 1 } = {}) {
+  // JSZip must be loaded (from index.html)
+  if (!window.JSZip) {
+    alert('JSZip not loaded. Add the JSZip <script> before index.js in index.html.');
+    return;
+  }
+
+  // best-effort: persist current frame edits
+  try { saveActiveLayerToKeyframe?.(); } catch {}
+
+  // last frame that has any ".frame-content-row" anywhere in the timeline
+  const endFrame = (() => {
+    let last = 1;
+    const rows = timelineFrames.querySelectorAll('.frame-row');
+    rows.forEach(row => {
+      const cells = row.querySelectorAll('.frame-cell');
+      for (let i = cells.length - 1; i >= 0; i--) {
+        if (cells[i].querySelector('.frame-content-row')) {
+          last = Math.max(last, i + 1);
+          break;
+        }
+      }
+    });
+    return Math.max(1, Math.min(totalFrames, last));
+  })();
+
+  const startFrame = 1;
+
+  // save state to restore after export
+  const prevFrame = currentFrame;
+
+  let prevSelectedIds = [];
+  let prevActiveId = null;
+  try {
+    ensureUIDsInContent?.();
+    prevSelectedIds = (selectedElements || []).map(el => el?.dataset?.uid).filter(Boolean);
+    prevActiveId = selectedElement?.dataset?.uid || null;
+  } catch {}
+
+  // ---- rasterize helper (same idea as exportImage) ----
+  async function rasterizeCurrentFrameToPngBlob() {
+    const exportSvg = document.createElementNS(NS, 'svg');
+    exportSvg.setAttribute('xmlns', NS);
+    exportSvg.setAttribute('width', stage.width * scale);
+    exportSvg.setAttribute('height', stage.height * scale);
+    exportSvg.setAttribute('viewBox', `0 0 ${stage.width} ${stage.height}`);
+
+    const bg = document.createElementNS(NS, 'rect');
+    bg.setAttribute('x', 0);
+    bg.setAttribute('y', 0);
+    bg.setAttribute('width', stage.width);
+    bg.setAttribute('height', stage.height);
+    bg.setAttribute('fill', stageRect.getAttribute('fill') || '#fff');
+    exportSvg.appendChild(bg);
+
+    const contentGroup = document.createElementNS(NS, 'g');
+    contentGroup.setAttribute('transform', `translate(${-stage.x}, ${-stage.y})`);
+    [...contentLayer.children].forEach(el => contentGroup.appendChild(el.cloneNode(true)));
+    exportSvg.appendChild(contentGroup);
+
+    const svgStr = new XMLSerializer().serializeToString(exportSvg);
+    const blob = new Blob([svgStr], { type: 'image/svg+xml;charset=utf-8' });
+    const url = URL.createObjectURL(blob);
+
+    const img = new Image();
+    img.decoding = 'async';
+    await new Promise((resolve, reject) => {
+      img.onload = resolve;
+      img.onerror = reject;
+      img.src = url;
+    });
+
+    const canvas = document.createElement('canvas');
+    canvas.width = stage.width * scale;
+    canvas.height = stage.height * scale;
+
+    const ctx = canvas.getContext('2d');
+    ctx.drawImage(img, 0, 0, canvas.width, canvas.height);
+
+    URL.revokeObjectURL(url);
+
+    const pngBlob = await new Promise(resolve => canvas.toBlob(resolve, 'image/png'));
+    return pngBlob;
+  }
+
+  // ---- ZIP build ----
+  const zip = new JSZip();
+
+  const stamp = new Date();
+  const pad2 = n => String(n).padStart(2, '0');
+  const baseName =
+    `PNG_Sequence_${stamp.getFullYear()}${pad2(stamp.getMonth() + 1)}${pad2(stamp.getDate())}_` +
+    `${pad2(stamp.getHours())}${pad2(stamp.getMinutes())}${pad2(stamp.getSeconds())}`;
+
+  const folder = zip.folder(baseName);
+
+  const total = endFrame - startFrame + 1;
+
+  // ✅ ask before heavy work (rendering + zipping)
+  const ok = confirm(`Export PNG sequence?\nFrames: ${total}\nScale: ${scale}x`);
+  if (!ok) {
+    // restore frame (in case anything changed earlier)
+    currentFrame = prevFrame;
+    renderFrame(currentFrame);
+    updatePlayhead?.();
+    return; // ✅ abort export
+  }
+
+  for (let f = startFrame; f <= endFrame; f++) {
+    currentFrame = f;
+    renderFrame(currentFrame);
+    updatePlayhead?.();
+
+    const pngBlob = await rasterizeCurrentFrameToPngBlob();
+    const filename = `frame_${String(f).padStart(4, '0')}.png`;
+
+    folder.file(filename, pngBlob);
+
+    console.log(`[exportPNGSequence ZIP] ${f}/${endFrame} (${total} frames)`);
+  }
+
+  // generate zip and download
+  const zipBlob = await zip.generateAsync({ type: 'blob' });
+
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(zipBlob);
+  a.download = `${baseName}.zip`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(a.href), 1000);
+
+  // restore previous state
+  currentFrame = prevFrame;
+  renderFrame(currentFrame);
+  updatePlayhead?.();
+
+  try {
+    selectedElements = (prevSelectedIds || [])
+      .map(id => contentLayer.querySelector(`[data-uid="${id}"]`))
+      .filter(Boolean);
+
+    selectedElement = prevActiveId
+      ? contentLayer.querySelector(`[data-uid="${prevActiveId}"]`)
+      : (selectedElements[selectedElements.length - 1] || null);
+
+    updateInspector?.();
+    drawSelectionBoxes?.();
+  } catch {}
+
+  alert(`Export complete: ${total} PNG frames in ${baseName}.zip`);
 }
 
 async function saveCanvas(canvas) {
@@ -3339,7 +3501,18 @@ strokeWidthInput.addEventListener('pointerdown', () => {
 
 strokeWidthInput.addEventListener('input', () => {
   if (!selectedElement) return;
+
   selectedElement.setAttribute('stroke-width', strokeWidthInput.value);
+
+  // ✅ persist to the frame store
+  if (activeTimelineLayerId) {
+    const g = selectedElement.closest('g[data-tl]');
+    if (g && g.dataset.tl === activeTimelineLayerId) {
+      ensureFrameMarker(activeTimelineLayerId, currentFrame);
+      saveActiveLayerToKeyframe();
+    }
+  }
+
   drawSelectionBoxes();
 });
 
@@ -3671,6 +3844,17 @@ const CP = (() => {
   }
 
   function close() {
+    // ✅ persist whatever color is currently applied to the element
+    const layerId = activeTimelineLayerId;
+    if (selectedElement && layerId) {
+      // only save if element is actually inside this timeline layer group
+      const g = selectedElement.closest('g[data-tl]');
+      if (g && g.dataset.tl === layerId) {
+        ensureFrameMarker(layerId, currentFrame);
+        saveActiveLayerToKeyframe();
+      }
+    }
+
     root.classList.add('hidden');
     backdrop.classList.add('hidden');
     dragging = null;
@@ -5235,6 +5419,14 @@ function addFrameContentRow(cell) {
   return inner;
 }
 
+function ensureFrameMarker(layerId, frameIndex) {
+  const row = timelineFrames.querySelector(`.frame-row[data-layer-id="${layerId}"]`);
+  if (!row) return;
+  const cell = row.querySelector(`.frame-cell[data-frame="${frameIndex}"]`);
+  if (!cell) return;
+  addFrameContentRow(cell); // safe: it won’t duplicate
+}
+
 function makeFrameCell(i) {
   const cell = document.createElement('div');
   cell.className = 'frame-cell';
@@ -5409,6 +5601,8 @@ for (let i = 1; i <= totalFrames; i++) {
 }
 
 timelineRuler.addEventListener('click', (e) => {
+  stopTimelinePlayback(); // ✅ add here (top)
+
   // click position inside ruler viewport
   const rect = timelineRuler.getBoundingClientRect();
   const localX = e.clientX - rect.left;
@@ -5428,13 +5622,16 @@ wireTimelineHorizontalScroll();
 updatePlayhead();
 
 timelineFrames.addEventListener('click', (e) => {
+  stopTimelinePlayback();
+
   const cell = e.target.closest('.frame-cell');
   if (!cell) return;
 
   const row = cell.closest('.frame-row');
   if (!row) return;
 
-  const idx = [...row.children].indexOf(cell);
+  const cells = [...row.querySelectorAll(':scope > .frame-cell')];
+  const idx = cells.indexOf(cell);
   if (idx < 0) return;
 
   currentFrame = idx + 1;
@@ -5465,6 +5662,8 @@ function setFrameFromRulerClientX(clientX) {
 timelineRuler.addEventListener('pointerdown', (e) => {
   // only left button
   if (e.button !== 0) return;
+
+  stopTimelinePlayback(); // ✅ add here (top)
 
   rulerScrubbing = true;
   rulerPointerId = e.pointerId;
@@ -5522,3 +5721,141 @@ function wireTimelineHorizontalScroll() {
   applyTimelineScrollX(timelineHScroll.scrollLeft);
   updatePlayhead();
 }
+
+/* ----------------------------------------------------------------------------- */
+/* --------------------------- Timeline playback (24fps) ------------------------ */
+/* ----------------------------------------------------------------------------- */
+const playBtn = document.getElementById('playBtn');
+const stopBtn = document.getElementById('stopBtn');
+const toFirstBtn = document.getElementById('toFirstBtn');
+const toLastBtn  = document.getElementById('toLastBtn');
+const stepBackBtn  = document.getElementById('stepBackBtn');
+const stepFrontBtn = document.getElementById('stepFrontBtn');
+
+const PLAY_FPS = 24; // ✅ for now (we'll make this editable later)
+let timelineIsPlaying = false;
+let timelinePlayTimer = null;
+
+const PLAY_ICON_HTML = playBtn ? playBtn.innerHTML : '';
+const STOP_ICON_HTML = `
+  <svg width="24" height="24" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg">
+    <rect x="6" y="6" width="12" height="12" fill="currentColor"/>
+  </svg>
+`;
+
+function getLastTimelineContentFrame() {
+  // scan ALL timeline rows (works even if you added content on a different layer)
+  let last = 1;
+
+  const rows = timelineFrames.querySelectorAll('.frame-row');
+  rows.forEach(row => {
+    const cells = row.querySelectorAll('.frame-cell');
+    for (let i = cells.length - 1; i >= 0; i--) {
+      // ✅ use non-:scope query so it works even if nested
+      if (cells[i].querySelector('.frame-content-row')) {
+        last = Math.max(last, i + 1);
+        break;
+      }
+    }
+  });
+
+  return Math.max(1, Math.min(totalFrames, last));
+}
+
+function stopTimelinePlayback() {
+  timelineIsPlaying = false;
+  if (timelinePlayTimer) {
+    clearInterval(timelinePlayTimer);
+    timelinePlayTimer = null;
+  }
+}
+
+function startTimelinePlayback() {
+  // clear any old timer first
+  stopTimelinePlayback();
+
+  const endFrame = getLastTimelineContentFrame();
+
+  // 🔎 this log will instantly tell you if endFrame is stuck at 1
+  console.log('[playback] currentFrame=', currentFrame, 'endFrame=', endFrame);
+
+  // if only frame 1 has content, don’t move (your requirement)
+  if (endFrame <= 1) return;
+
+  // if playhead is already past the end, restart from 1
+  if (currentFrame >= endFrame) currentFrame = 1;
+
+  timelineIsPlaying = true;
+
+  const ms = Math.max(1, Math.round(1000 / PLAY_FPS));
+
+  timelinePlayTimer = setInterval(() => {
+    const end = getLastTimelineContentFrame();
+
+    if (currentFrame >= end) {
+      stopTimelinePlayback();
+      return;
+    }
+
+    currentFrame += 1;
+    renderFrame(currentFrame);
+    updatePlayhead();
+  }, ms);
+}
+
+/* ----------------- Controller button ---------------- */
+playBtn.onclick = () => {
+  console.log('playBtn');
+  startTimelinePlayback();
+};
+
+stopBtn.onclick = () => {
+  console.log('stopBtn');
+  stopTimelinePlayback();
+};
+
+toFirstBtn.onclick = () => {
+  stopTimelinePlayback();
+
+  currentFrame = 1;
+  renderFrame(currentFrame);
+  updatePlayhead();
+
+  // optional if you already have this helper:
+  // ensurePlayheadVisible();
+};
+
+toLastBtn.onclick = () => {
+  stopTimelinePlayback();
+
+  const last = getLastTimelineContentFrame(); // ✅ last frame that has .frame-content-row
+  currentFrame = last;
+
+  renderFrame(currentFrame);
+  updatePlayhead();
+
+  // optional if you already have this helper:
+  // ensurePlayheadVisible();
+};
+
+stepBackBtn.onclick = () => {
+  stopTimelinePlayback();
+
+  currentFrame = Math.max(1, currentFrame - 1);
+  renderFrame(currentFrame);
+  updatePlayhead();
+
+  // optional if you have it:
+  // ensurePlayheadVisible();
+};
+
+stepFrontBtn.onclick = () => {
+  stopTimelinePlayback();
+
+  currentFrame = Math.min(getLastTimelineContentFrame(), currentFrame + 1);
+  renderFrame(currentFrame);
+  updatePlayhead();
+
+  // optional if you have it:
+  // ensurePlayheadVisible();
+};
