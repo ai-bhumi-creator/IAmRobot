@@ -1379,3 +1379,157 @@ html, body{
 ::-webkit-scrollbar-thumb:hover{
   background-color: rgba(255,255,255,0.26) !important;
 }
+
+/* ===========================================================
+   OPTIONS PANEL UPGRADE (no layout changes)
+   Paste at END of index.css
+   =========================================================== */
+
+/* Panel surface + subtle inner edge */
+#optionsPanel{
+  background:
+    radial-gradient(900px 420px at 50% 0%, rgba(77,163,255,0.06), transparent 55%),
+    linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.10)),
+    linear-gradient(180deg, #151c29, #0f141e) !important;
+  border-left: 1px solid rgba(255,255,255,0.10) !important;
+  box-shadow:
+    inset 1px 0 0 rgba(255,255,255,0.05),
+    inset 0 1px 0 rgba(255,255,255,0.05) !important;
+}
+
+/* Header: more “card-like” */
+#optionsPanel .options-header{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.10)),
+    linear-gradient(180deg, #1b2332, #141b26) !important;
+  border-bottom: 1px solid rgba(255,255,255,0.10) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+  letter-spacing: 0.2px;
+}
+
+/* Content area gets nicer padding + scroll feel (doesn't change layout) */
+#optionsPanel .options-content{
+  padding: 10px 10px 14px !important;
+}
+
+/* Inspector groups: make them look like sections/cards */
+#optionsPanel .inspector-group{
+  margin: 10px 8px !important;
+  padding: 10px 10px 12px !important;
+  border-radius: 10px !important;
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.05), rgba(0,0,0,0.16)) !important;
+  border: 1px solid rgba(255,255,255,0.10) !important;
+  box-shadow:
+    inset 0 1px 0 rgba(255,255,255,0.06),
+    0 10px 28px rgba(0,0,0,0.28) !important;
+}
+
+/* Group title: sharper + muted */
+#optionsPanel .group-title{
+  font-size: 11px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.7px;
+  color: rgba(255,255,255,0.70) !important;
+  margin-bottom: 8px !important;
+}
+
+/* Empty state: like a soft hint */
+#optionsPanel .inspector-empty{
+  margin: 10px 8px !important;
+  padding: 12px 12px !important;
+  border-radius: 10px !important;
+  background: rgba(255,255,255,0.04) !important;
+  border: 1px dashed rgba(255,255,255,0.14) !important;
+  color: rgba(255,255,255,0.65) !important;
+}
+
+/* Labels */
+#optionsPanel label{
+  color: rgba(255,255,255,0.78) !important;
+}
+#optionsPanel label > span,
+#optionsPanel .color-label{
+  color: rgba(255,255,255,0.70) !important;
+}
+
+/* Inputs: modern dark fields */
+#optionsPanel input[type="number"],
+#optionsPanel input[type="text"],
+#optionsPanel input[type="range"],
+#optionsPanel select{
+  background: rgba(0,0,0,0.28) !important;
+  border: 1px solid rgba(255,255,255,0.12) !important;
+  color: rgba(255,255,255,0.92) !important;
+  border-radius: 10px !important;
+  outline: none !important;
+}
+
+/* number/text/select padding only (won’t affect layout containers) */
+#optionsPanel input[type="number"],
+#optionsPanel input[type="text"],
+#optionsPanel select{
+  padding: 7px 10px !important;
+}
+
+/* Focus glow */
+#optionsPanel input:focus,
+#optionsPanel select:focus{
+  border-color: rgba(77,163,255,0.55) !important;
+  box-shadow: 0 0 0 3px rgba(77,163,255,0.18) !important;
+}
+
+/* Range slider polish (safe) */
+#optionsPanel input[type="range"]{
+  height: 22px;
+  background: transparent !important;
+}
+#optionsPanel input[type="range"]::-webkit-slider-runnable-track{
+  height: 6px;
+  border-radius: 999px;
+  background: linear-gradient(90deg, rgba(77,163,255,0.85), rgba(46,138,255,0.55));
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.18);
+}
+#optionsPanel input[type="range"]::-webkit-slider-thumb{
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -4px;
+  border-radius: 50%;
+  background: #e8eefc;
+  border: 1px solid rgba(0,0,0,0.35);
+  box-shadow: 0 6px 16px rgba(0,0,0,0.35);
+}
+
+/* Option list rows (if you use option-item) */
+#optionsPanel .option-item{
+  border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+  border-radius: 8px;
+}
+#optionsPanel .option-item:hover{
+  background: rgba(255,255,255,0.06) !important;
+}
+
+/* Popout handle: more premium */
+#optionsPopout{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.08), rgba(0,0,0,0.18)),
+    linear-gradient(180deg, #2a3550, #1b2332) !important;
+  border-color: rgba(255,255,255,0.14) !important;
+  box-shadow: 0 10px 28px rgba(0,0,0,0.38) !important;
+}
+#optionsPopout:hover{
+  filter: brightness(1.05);
+}
+
+/* Mini buttons in inspector: add depth */
+#optionsPanel .cp-mini{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.06), rgba(0,0,0,0.18)),
+    linear-gradient(180deg, #273246, #1f2735) !important;
+  border: 1px solid rgba(255,255,255,0.14) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.08), 0 6px 18px rgba(0,0,0,0.30) !important;
+}
+#optionsPanel .cp-mini:hover{
+  border-color: rgba(77,163,255,0.35) !important;
+}
