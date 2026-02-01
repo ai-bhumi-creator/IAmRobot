@@ -1173,3 +1173,209 @@ input[type='number'] {
 .scrollable-element::-webkit-scrollbar-thumb:hover {
   background: #555;
 }
+
+/* ===========================================================
+   PRO SHADING THEME (SAFE)
+   - ONLY colors / gradients / shadows / borders
+   - DOES NOT touch layout: no display/flex/position/size changes
+   Paste at END of index.css
+   =========================================================== */
+
+:root{
+  --ui-bg0: #0f1217;
+  --ui-bg1: #101520;
+
+  --panel0: #121826;
+  --panel1: #141b29;
+  --panel2: #1a2230;
+  --panel3: #202a3a;
+
+  --stroke: rgba(255,255,255,0.10);
+  --stroke2: rgba(255,255,255,0.14);
+
+  --text: rgba(255,255,255,0.92);
+  --muted: rgba(255,255,255,0.65);
+
+  --btn0: #1f2735;
+  --btn1: #273246;
+
+  --accent: #4da3ff;
+  --danger: #ff3b30;
+
+  --shadow-lg: 0 14px 40px rgba(0,0,0,0.45);
+  --shadow-md: 0 8px 24px rgba(0,0,0,0.38);
+  --shadow-in: inset 0 1px 0 rgba(255,255,255,0.08);
+}
+
+/* App background */
+html, body{
+  background:
+    radial-gradient(1200px 800px at 35% 0%, rgba(77,163,255,0.10), transparent 55%),
+    radial-gradient(900px 700px at 100% 15%, rgba(217,92,230,0.08), transparent 60%),
+    linear-gradient(180deg, var(--ui-bg0), var(--ui-bg1));
+  color: var(--text);
+}
+
+/* Your app base */
+#app{
+  background:
+    linear-gradient(180deg, rgba(255,255,255,0.04), rgba(0,0,0,0.08)),
+    linear-gradient(180deg, var(--panel0), var(--panel1));
+  color: var(--text);
+}
+
+/* Menubar: bevel like real editors */
+.menu-bar{
+  background: linear-gradient(180deg, #161c28, #101520) !important;
+  border-bottom: 1px solid var(--stroke) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
+.menu:hover{
+  background: rgba(255,255,255,0.06) !important;
+}
+
+/* Dropdown: deeper + shadow */
+.dropdown{
+  background: linear-gradient(180deg, #1b2332, #141b26) !important;
+  border: 1px solid var(--stroke2) !important;
+  box-shadow: var(--shadow-lg) !important;
+  border-radius: 10px !important;
+  overflow: hidden !important;
+}
+.item:hover{
+  background: rgba(77,163,255,0.14) !important;
+}
+.separator{
+  background: rgba(255,255,255,0.10) !important;
+}
+.shortcut{
+  color: var(--muted) !important;
+}
+
+/* Top toolbar shading */
+.toolbar{
+  background: linear-gradient(180deg, #151c29, #101621) !important;
+  border-bottom: 1px solid var(--stroke) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.06) !important;
+}
+.toolbar-separator{
+  background: rgba(255,255,255,0.10) !important;
+}
+
+/* Buttons: bevel + glow on hover, but NO sizing changes */
+.tool-btn{
+  background: linear-gradient(180deg, var(--btn1), var(--btn0)) !important;
+  border: 1px solid var(--stroke2) !important;
+  box-shadow: var(--shadow-in), 0 3px 10px rgba(0,0,0,0.35) !important;
+  border-radius: 8px !important;
+  color: rgba(255,255,255,0.90) !important;
+}
+.tool-btn:hover{
+  background: linear-gradient(180deg, #2c3850, #222c3e) !important;
+  border-color: rgba(77,163,255,0.35) !important;
+  box-shadow: var(--shadow-in), 0 6px 18px rgba(0,0,0,0.45) !important;
+}
+.tool-btn.active{
+  border-color: rgba(77,163,255,0.55) !important;
+  box-shadow: var(--shadow-in), 0 0 0 1px rgba(77,163,255,0.18), 0 8px 22px rgba(0,0,0,0.45) !important;
+}
+
+/* Left toolbar panel */
+.left-toolbar{
+  background: linear-gradient(180deg, #151c29, #0f141e) !important;
+  border-right: 1px solid var(--stroke) !important;
+}
+
+/* Right panels (Options + Layers) */
+#optionsPanel,
+#layersPanel{
+  background: linear-gradient(180deg, #151c29, #0f141e) !important;
+  border-left: 1px solid var(--stroke) !important;
+  box-shadow: inset 1px 0 0 rgba(255,255,255,0.04) !important;
+  color: var(--text) !important;
+}
+.options-header,
+.layers-header{
+  background: linear-gradient(180deg, #1b2332, #141b26) !important;
+  border-bottom: 1px solid var(--stroke) !important;
+}
+#optionsPopout{
+  background: linear-gradient(180deg, #2a3550, #1b2332) !important;
+  border-color: var(--stroke2) !important;
+  box-shadow: var(--shadow-md) !important;
+}
+
+/* Lists: cleaner rows */
+.layer-item{
+  border-bottom: 1px solid rgba(255,255,255,0.06) !important;
+}
+.layer-item:hover{
+  background: rgba(255,255,255,0.06) !important;
+}
+.layer-item.selected{
+  background: rgba(77,163,255,0.14) !important;
+  box-shadow: inset 0 0 0 1px rgba(77,163,255,0.25) !important;
+}
+
+/* Timeline panel: real editor look */
+#timelinePanel{
+  background: linear-gradient(180deg, #151c29, #0f141e) !important;
+  border-top: 1px solid var(--stroke) !important;
+}
+#timelineHeader,
+#timelineRuler{
+  background: linear-gradient(180deg, #1b2332, #141b26) !important;
+  border-bottom: 1px solid var(--stroke) !important;
+}
+#timelineLayersLabel{
+  background: linear-gradient(180deg, #1b2332, #141b26) !important;
+  border-right: 1px solid var(--stroke) !important;
+}
+
+/* Frame grid polish (no sizing changes) */
+.frame-cell{
+  background: rgba(255,255,255,0.05) !important;
+  border-right: 1px solid rgba(255,255,255,0.08) !important;
+  border-bottom: 1px solid rgba(0,0,0,0.35) !important;
+}
+.frame-cell.keyframe{
+  background: linear-gradient(180deg, #ffb23f, #f08a00) !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.25) !important;
+}
+
+/* The draggable “content bar” row */
+.frame-content-row{
+  background-color: rgba(255,255,255,0.08) !important;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,0.55) !important;
+}
+.frame-content-row.has-content{
+  background: linear-gradient(180deg, rgba(77,163,255,1), rgba(46,138,255,1)) !important;
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.20), 0 6px 18px rgba(0,0,0,0.25) !important;
+}
+
+/* Playhead glow */
+#playhead{
+  background: var(--danger) !important;
+  box-shadow: 0 0 0 1px rgba(0,0,0,0.35), 0 0 18px rgba(255,59,48,0.25) !important;
+}
+
+/* Context menu: same dropdown style */
+.context-menu{
+  background: linear-gradient(180deg, #1b2332, #141b26) !important;
+  border: 1px solid var(--stroke2) !important;
+  box-shadow: var(--shadow-lg) !important;
+}
+.context-item:hover{
+  background: rgba(77,163,255,0.14) !important;
+}
+
+/* Scrollbar: subtle */
+::-webkit-scrollbar{
+  background-color: rgba(0,0,0,0.35) !important;
+}
+::-webkit-scrollbar-thumb{
+  background-color: rgba(255,255,255,0.18) !important;
+}
+::-webkit-scrollbar-thumb:hover{
+  background-color: rgba(255,255,255,0.26) !important;
+}
