@@ -58,12 +58,21 @@ const inspectorEmpty = document.getElementById('inspectorEmpty');
 const inspectorPath = document.getElementById('inspectorPath');
 const strokeWidthInput = document.getElementById('strokeWidth');
 
+const NS = 'http://www.w3.org/2000/svg';
+
 let stage = {
   x: 0,
   y: 0,
   width: 1920,
-  height: 1080
+  height: 1080,
+  bg: "#ffffff",     // stage/background color
+  fps: 24,           // timeline playback rate
+  units: "px",       // "px" | "pt" | "in" | "cm" | "mm"
 };
+
+let camX = 0;
+let camY = 0;
+let camScale = 1;
 
 let drawing = false;
 let path = null;
@@ -124,6 +133,8 @@ let handleDrag = null; // stores drag state
 let isRotateDragging = false;
 let rotateDrag = null;
 
+const MIN_ZOOM = 0.1;
+const MAX_ZOOM = 10;
 const BASE_GRID_SIZE = 25;   // Boxy-like
 const MAJOR_STEP = 5;
 const RULER_SIZE = 20;
@@ -1269,12 +1280,65 @@ function handleSplineMouseMove(e) {
 }
 
 window.addEventListener('keydown', (e) => {
+  // ✅ F5 = Insert Frame (prevent browser reload)
+  const isF5 = (e.key === 'F5' || e.code === 'F5' || e.keyCode === 116);
+  if (isF5 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    e.preventDefault();
+    e.stopPropagation();
+
+    // --- remember current row + selected cell index BEFORE inserting ---
+    const rowBefore =
+      document.querySelector('.frame-content-row.active') ||
+      document.querySelector('.frame-content-row');
+    const selectedBefore = rowBefore?.querySelector('.selected, .active, [aria-selected="true"]') || null;
+    const selectedIndexBefore = (rowBefore && selectedBefore)
+      ? Array.from(rowBefore.children).indexOf(selectedBefore)
+      : -1;
+    const countBefore = rowBefore ? rowBefore.children.length : 0;
+
+    // Call the same thing your Insert Frame menu/button uses
+    const insertBtn = document.getElementById('insertFrame');
+    if (insertBtn) insertBtn.click();
+
+    // If you have a context menu close function, keep this (optional)
+    if (typeof closeContextMenu === 'function') closeContextMenu();
+
+    // ✅ move playhead to the newly added frame-cell
+    requestAnimationFrame(() => {
+      requestAnimationFrame(() => {
+        const rowAfter =
+          document.querySelector('.frame-content-row.active') ||
+          document.querySelector('.frame-content-row');
+        if (!rowAfter) return;
+
+        const cells = Array.from(rowAfter.children);
+
+        let target = null;
+
+        // best guess: after inserting, move to next cell relative to previously selected
+        if (selectedIndexBefore >= 0) {
+          target = cells[selectedIndexBefore + 1] || cells[selectedIndexBefore] || cells[cells.length - 1];
+        } else if (cells.length > countBefore) {
+          // if selection not found, but a new cell appeared, click the last one
+          target = cells[cells.length - 1];
+        } else {
+          // last fallback: use whatever is currently "selected" and go next
+          const selNow = rowAfter.querySelector('.selected, .active, [aria-selected="true"]');
+          target = selNow?.nextElementSibling || cells[cells.length - 1];
+        }
+
+        if (target) target.click();
+      });
+    });
+
+    return;
+  }
+
+  // ---- spline-only shortcuts ----
   if (activeTool !== 'spline') return;
 
   if (e.key === 'Enter') {
     e.preventDefault();
-    // if only one anchor: remove it (cancel)
-    // if two anchors: makes a straight line (commit open)
     commitSpline(false);
   }
 
@@ -1282,7 +1346,7 @@ window.addEventListener('keydown', (e) => {
     e.preventDefault();
     cancelSpline();
   }
-});
+}, true); // ✅ capture=true helps ensure F5 doesn't reload
 
 /*-----------------------------------------------------------*/
 function getLocalDOMMatrix(el) {
@@ -1400,13 +1464,6 @@ function snapAnchorsIfClose(path, clickedIndex) {
 /* ----------------------------------------------------------------------------- */
 /* ----------------------------- Camera zoom limit ----------------------------- */
 /* ----------------------------------------------------------------------------- */
-let camX = 0;
-let camY = 0;
-let camScale = 1;
-
-const MIN_ZOOM = 0.5;
-const MAX_ZOOM = 10;
-
 function updateCamera() {
   camera.setAttribute('transform', `translate(${camX}, ${camY}) scale(${camScale})`);
 
@@ -1441,16 +1498,20 @@ function updateStage() {
   stageRect.setAttribute('height', stage.height);
 }
 
-function centerStage() {
+function centerStage(padding = 40) {
   const rect = svg.getBoundingClientRect();
 
-  camScale = 1;
+  const availW = Math.max(1, rect.width  - padding * 2);
+  const availH = Math.max(1, rect.height - padding * 2);
 
-  camX = (rect.width - stage.width) / 2 - stage.x;
-  camY = (rect.height - stage.height) / 2 - stage.y;
+  const scaleX = availW / stage.width;
+  const scaleY = availH / stage.height;
 
-  camX = Math.round(camX);
-  camY = Math.round(camY);
+  camScale = Math.min(scaleX, scaleY);
+  camScale = Math.max(MIN_ZOOM, Math.min(MAX_ZOOM, camScale));
+
+  camX = (rect.width  - stage.width  * camScale) / 2 - stage.x * camScale;
+  camY = (rect.height - stage.height * camScale) / 2 - stage.y * camScale;
 
   updateCamera();
 }
@@ -2230,7 +2291,6 @@ function drawRulers() {
   const contentX = rulerX.querySelector('.ruler-content') || rulerX;
   const contentY = rulerY.querySelector('.ruler-content') || rulerY;
 
-  // ✅ clear only ticks/text, not the whole SVG if you have background layers
   contentX.innerHTML = '';
   contentY.innerHTML = '';
 
@@ -2238,11 +2298,30 @@ function drawRulers() {
   const width = rect.width;
   const height = rect.height;
 
-  const step = RULER_STEP * camScale;
-  if (step < 25) return;
+  // --- adaptive ruler step so ticks never get too dense ---
+  let worldStep = RULER_STEP;            // in "world" units (document units)
+  let pxStep = worldStep * camScale;     // in screen pixels
+
+  // If zoomed out, increase worldStep until ticks are at least 25px apart
+  while (pxStep < 25) {
+    worldStep *= 2;
+    pxStep = worldStep * camScale;
+    if (worldStep > 1e9) break; // safety
+  }
+
+  // Optional: if zoomed in a lot, you can make ticks denser (cap at ~120px)
+  while (pxStep > 120 && worldStep > RULER_STEP) {
+    worldStep /= 2;
+    pxStep = worldStep * camScale;
+  }
+
+  const majorWorld = worldStep * 5;
+
+  // Safe modulo for negative camX/camY
+  const mod = (n, m) => ((n % m) + m) % m;
 
   // Horizontal
-  for (let x = camX % step; x < width; x += step) {
+  for (let x = mod(camX, pxStep); x < width; x += pxStep) {
     const value = Math.round((x - camX) / camScale);
 
     const line = document.createElementNS(NS, 'line');
@@ -2252,7 +2331,7 @@ function drawRulers() {
     line.setAttribute('y2', RULER_SIZE);
     line.classList.add('ruler-line');
 
-    if (value % (RULER_STEP * 5) === 0) {
+    if (value % majorWorld === 0) {
       line.classList.add('major');
 
       const text = document.createElementNS(NS, 'text');
@@ -2267,7 +2346,7 @@ function drawRulers() {
   }
 
   // Vertical
-  for (let y = camY % step; y < height; y += step) {
+  for (let y = mod(camY, pxStep); y < height; y += pxStep) {
     const value = Math.round((y - camY) / camScale);
 
     const line = document.createElementNS(NS, 'line');
@@ -2277,7 +2356,7 @@ function drawRulers() {
     line.setAttribute('y2', y);
     line.classList.add('ruler-line');
 
-    if (value % (RULER_STEP * 5) === 0) {
+    if (value % majorWorld === 0) {
       line.classList.add('major');
 
       const text = document.createElementNS(NS, 'text');
