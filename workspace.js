@@ -151,6 +151,48 @@ let isCtrlKeyPressed = false;
 let isShiftKeyPressed = false;
 
 // ===============================
+// Svg delete
+// ===============================
+function ensureStoreLayerFrame(layerIndex, frame) {
+  window.timelineStore = window.timelineStore || { layers: [] };
+  window.timelineStore.layers = window.timelineStore.layers || [];
+  while (window.timelineStore.layers.length <= layerIndex) {
+    window.timelineStore.layers.push({ frames: {} });
+  }
+  const layer = window.timelineStore.layers[layerIndex];
+  layer.frames = layer.frames || {};
+  return layer.frames[String(frame)] || null;
+}
+
+function commitActiveSvgToTimelineStore() {
+  const frame = window.timelineCurrentFrame || 1;
+  const layerIndex = window.timelineGetActiveLayer?.() ?? 0;
+
+  window.timelineStore = window.timelineStore || { layers: [] };
+  window.timelineStore.layers = window.timelineStore.layers || [];
+  while (window.timelineStore.layers.length <= layerIndex) {
+    window.timelineStore.layers.push({ frames: {} });
+  }
+
+  const layer = window.timelineStore.layers[layerIndex];
+  layer.frames = layer.frames || {};
+
+  // If nothing left, remove the keyframe data entirely
+  if (!penToolState.paths || penToolState.paths.length === 0) {
+    delete layer.frames[String(frame)];
+    return { frame, layerIndex };
+  }
+
+  // Save a snapshot of current SVG content for this frame/layer
+  layer.frames[String(frame)] = {
+    paths: JSON.parse(JSON.stringify(penToolState.paths)),
+    transforms: JSON.parse(JSON.stringify(pathTransformations)),
+  };
+
+  return { frame, layerIndex };
+}
+
+// ===============================
 // Timeline storage: per layer + frame
 // ===============================
 window.timelineStore = window.timelineStore || { layers: [] };
@@ -724,6 +766,69 @@ function getPathBoundingBox(pathIndex) {
   };
 }
 
+// ✅ When a layer becomes locked, clear any active selections/transform boxes on that layer
+window.onTimelineLayerLockChanged = function onTimelineLayerLockChanged(layerIndex, locked) {
+  if (!locked) return;
+
+  const activeLayer = window.timelineGetActiveLayer?.() ?? 0;
+  if ((layerIndex | 0) !== (activeLayer | 0)) return;
+
+  // Clear SVG selection + transform state
+  isSvgSelected = false;
+  selectedSvgGroup = null;
+  selectedPath = null;
+  selectedAnchor = null;
+  selectedHandle = null;
+
+  isSvgDragging = false;
+  isSvgScaling = false;
+  isSvgRotating = false;
+  isDragging = false;
+
+  // Clear marquee / potential selection visuals
+  isPotentialMarquee = false;
+  isMarquee = false;
+
+  // Clear Image selection + transform state (so box/handles disappear)
+  isImageSelected = false;
+  selectedImageInstanceId = null;
+  isImgDragging = false;
+  isImgScaling = false;
+  isImgRotating = false;
+  activeImgScaleHandle = 0;
+
+  // Stop any drawing states
+  penToolState.isDrawing = false;
+  isRectDrawing = false;
+  isOvalDrawing = false;
+
+  // Sync UI
+  syncPickerGlobals();
+  window.flashColorPickerSyncFromSelection?.();
+  updatePropertiesPanel?.();
+
+  draw();
+};
+
+window.workspaceHasSvgAt = function workspaceHasSvgAt(frame, layerIndex) {
+  const f = frame | 0;
+  const l = layerIndex | 0;
+
+  // If we're asking about the CURRENT active frame/layer,
+  // also consider the live edit state (penToolState)
+  const curF = window.timelineCurrentFrame ?? 1;
+  const curL = window.timelineGetActiveLayer?.() ?? 0;
+
+  if (f === (curF | 0) && l === (curL | 0)) {
+    if (window.penToolState?.paths && window.penToolState.paths.length > 0) return true;
+    // if penToolState isn't global in your file, remove "window." and just use penToolState
+  }
+
+  // Saved keyframe SVG in timelineStore
+  const fr = window.timelineStore?.layers?.[l]?.frames?.[String(f)];
+  return !!(fr && Array.isArray(fr.paths) && fr.paths.length > 0);
+};
+
 // ===============================
 // Rectangle tool helpers ✅ (handles visible)
 // ===============================
@@ -1135,6 +1240,9 @@ function drawAllLayersAtCurrentFrame() {
 
   // Flash-style: layer 0 is topmost, so draw from bottom -> top (highest index down to 0).
   for (let layerIndex = store.layers.length - 1; layerIndex >= 0; layerIndex--) {
+    // ✅ Eye: skip hidden layers
+    if (store.layers[layerIndex]?.visible === false) continue;
+
     if (layerIndex === activeLayer) {
       // active layer uses editor arrays (paths + transforms already loaded)
       drawPaths();
@@ -2147,20 +2255,20 @@ canvas.addEventListener("mousedown", (e) => {
 });
 
 canvas.addEventListener("pointerdown", (e) => {
-  // Middle mouse => pan viewport
+  const isLocked = (idx) => window.timelineIsLayerLocked?.(idx) === true;
+  const activeLayerNow = window.timelineGetActiveLayer?.() ?? 0;
+
+  // Middle mouse => pan viewport (ALWAYS allowed)
   if (e.pointerType === "mouse" && e.button === 1) {
     e.preventDefault();
     canvas.setPointerCapture(e.pointerId);
 
     const mousePos = getCanvasMousePos(e);
 
-    // ✅ fix: use mousePos
     lastMouseScreen = { x: mousePos.x, y: mousePos.y };
     hasMouse = true;
 
     isPanning = true;
-
-    // ✅ cursor when pan starts
     canvas.style.cursor = "grabbing";
 
     panStart = { x: mousePos.x, y: mousePos.y };
@@ -2194,13 +2302,16 @@ canvas.addEventListener("pointerdown", (e) => {
       window.flashColorPickerSyncFromSelection?.();
     }
 
-    const hit = pickTopmostPathAcrossLayersForSubselection(pWorld);
+    let hit = pickTopmostPathAcrossLayersForSubselection(pWorld);
+
+    // ✅ LOCK: ignore hits on locked layers
+    if (hit && isLocked(hit.layerIndex)) hit = null;
+
     if (hit) {
       // Flash: clicking anything activates that layer
       window.timelineSetActiveLayer?.(hit.layerIndex);
       window.onTimelineChanged?.(window.timelineCurrentFrame || 1, hit.layerIndex);
 
-      // Select the path + optional anchor/handle
       selectedPath = hit.pathIndex;
       selectedAnchor = hit.anchorIndex;
       selectedHandle = hit.handle;
@@ -2208,9 +2319,15 @@ canvas.addEventListener("pointerdown", (e) => {
       syncPickerGlobals();
       window.flashColorPickerSyncFromSelection?.();
 
+      // ✅ LOCK: if the target layer is locked, do not start dragging
+      if (isLocked(hit.layerIndex)) {
+        isDragging = false;
+        draw();
+        return;
+      }
+
       isDragging = true;
 
-      // Setup drag start/offset exactly like your existing logic expects
       const pLocal = worldToLocalPoint(selectedPath, pWorld.x, pWorld.y);
       dragStart = { x: pLocal.x, y: pLocal.y };
 
@@ -2238,7 +2355,6 @@ canvas.addEventListener("pointerdown", (e) => {
         dragOffset = { x: 0, y: 0 };
       }
     } else {
-      // no hit: clear selection
       isDragging = false;
       selectedPath = null;
       selectedAnchor = null;
@@ -2252,6 +2368,12 @@ canvas.addEventListener("pointerdown", (e) => {
     return;
   }
 
+  // ✅ LOCK: drawing tools cannot operate on locked active layer
+  if (activeTool === "pen" || activeTool === "rectangle" || activeTool === "oval") {
+    const layer = window.timelineGetActiveLayer?.() ?? 0;
+    if (isLocked(layer)) return;
+  }
+
   // Pen tool
   if (activeTool === "pen") {
     if (e.pointerType === "mouse" && e.button !== 0) return;
@@ -2263,7 +2385,6 @@ canvas.addEventListener("pointerdown", (e) => {
     if (isSvgSelected) {
       isSvgSelected = false;
       selectedSvgGroup = null;
-
       syncPickerGlobals();
       window.flashColorPickerSyncFromSelection?.();
     }
@@ -2333,11 +2454,33 @@ canvas.addEventListener("pointerdown", (e) => {
     const mousePos = getCanvasMousePos(e);
     const p = screenToStage(mousePos.x, mousePos.y);
 
+    // ✅ If selected image belongs to locked layer, disable image editing
+    if (isImageSelected && selectedImageInstanceId) {
+      const instSel = getImageInstanceById(selectedImageInstanceId);
+      if (instSel && isLocked(instSel.layerIndex ?? activeLayerNow)) {
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
+      }
+    }
+
+    // ✅ If selected SVG belongs to locked active layer, disable svg editing
+    if (isSvgSelected && selectedSvgGroup !== null) {
+      const curLayer = window.timelineGetActiveLayer?.() ?? 0;
+      if (isLocked(curLayer)) {
+        isSvgDragging = false;
+        isSvgScaling = false;
+        isSvgRotating = false;
+      }
+    }
+
     // ✅ 0) If an image is already selected, allow clicking its handles even outside the image
     if (isImageSelected && selectedImageInstanceId) {
       const instSel = getImageInstanceById(selectedImageInstanceId);
-      if (instSel) {
-        // rotation handle
+      if (instSel && !isLocked(instSel.layerIndex ?? activeLayerNow)) {
         if (isPointNearImageRotationHandle(p, instSel)) {
           isImgRotating = true;
           isImgDragging = false;
@@ -2349,7 +2492,6 @@ canvas.addEventListener("pointerdown", (e) => {
           return;
         }
 
-        // scale handles
         const sh = isPointNearImageScaleHandle(p, instSel);
         if (sh > 0) {
           isImgScaling = true;
@@ -2362,7 +2504,6 @@ canvas.addEventListener("pointerdown", (e) => {
           return;
         }
 
-        // center handle (and optionally allow drag if you click image)
         if (isPointNearImageCenterHandle(p, instSel)) {
           isImgDragging = true;
           isImgScaling = false;
@@ -2376,10 +2517,12 @@ canvas.addEventListener("pointerdown", (e) => {
     }
 
     // ✅ FIRST: image selection (images are drawn on top of vectors)
-    const hitImg = pickTopmostImageInstance(p);
+    let hitImg = pickTopmostImageInstance(p);
+
+    // ✅ LOCK: ignore images on locked layers
+    if (hitImg && isLocked(hitImg.layerIndex ?? activeLayerNow)) hitImg = null;
 
     if (hitImg) {
-      // clear svg selection if any
       isSvgSelected = false;
       selectedSvgGroup = null;
       selectedPath = null;
@@ -2389,7 +2532,7 @@ canvas.addEventListener("pointerdown", (e) => {
       isImageSelected = true;
       selectedImageInstanceId = hitImg.id;
 
-      // Handle checks for current selected image
+      // handle checks
       if (isPointNearImageRotationHandle(p, hitImg)) {
         isImgRotating = true;
         isImgDragging = false;
@@ -2426,8 +2569,8 @@ canvas.addEventListener("pointerdown", (e) => {
     clickStartPos = { x: mousePos.x, y: mousePos.y };
     let clickedOnSomething = false;
 
-    // Handle checks for current selection
-    if (isSvgSelected && selectedSvgGroup !== null) {
+    // Handle checks for current selection (ONLY if active layer not locked)
+    if (isSvgSelected && selectedSvgGroup !== null && !isLocked(window.timelineGetActiveLayer?.() ?? 0)) {
       const pathIndex = selectedSvgGroup;
 
       if (isPointNearRotationHandle(p, pathIndex)) {
@@ -2436,7 +2579,6 @@ canvas.addEventListener("pointerdown", (e) => {
         isSvgScaling = false;
         svgDragStart = { x: p.x, y: p.y };
 
-        // update pivot to CURRENT local bbox center (keep no jump)
         const t = pathTransformations[pathIndex];
         if (t) {
           const local = getLocalBBox(pathIndex);
@@ -2445,10 +2587,8 @@ canvas.addEventListener("pointerdown", (e) => {
             const newPivotY = local.centerY;
 
             const before = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
-
             t.pivotX = newPivotX;
             t.pivotY = newPivotY;
-
             const after = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
 
             t.x = (t.x ?? 0) + (before.x - after.x);
@@ -2462,7 +2602,6 @@ canvas.addEventListener("pointerdown", (e) => {
         return;
       }
 
-      // ✅ FIXED SCALING: pin opposite corner by moving pivot there (no drift)
       const scaleHandle = isPointNearScaleHandle(p, pathIndex);
       if (scaleHandle > 0) {
         isSvgScaling = true;
@@ -2479,28 +2618,14 @@ canvas.addEventListener("pointerdown", (e) => {
             let oppositeX, oppositeY;
 
             switch (scaleHandle) {
-              case 1: // TL dragged => opposite is BR
-                oppositeX = bbox.x + bbox.width;
-                oppositeY = bbox.y + bbox.height;
-                break;
-              case 2: // TR dragged => opposite is BL
-                oppositeX = bbox.x;
-                oppositeY = bbox.y + bbox.height;
-                break;
-              case 3: // BR dragged => opposite is TL
-                oppositeX = bbox.x;
-                oppositeY = bbox.y;
-                break;
-              case 4: // BL dragged => opposite is TR
-                oppositeX = bbox.x + bbox.width;
-                oppositeY = bbox.y;
-                break;
+              case 1: oppositeX = bbox.x + bbox.width; oppositeY = bbox.y + bbox.height; break;
+              case 2: oppositeX = bbox.x;             oppositeY = bbox.y + bbox.height; break;
+              case 3: oppositeX = bbox.x;             oppositeY = bbox.y;               break;
+              case 4: oppositeX = bbox.x + bbox.width; oppositeY = bbox.y;              break;
             }
 
-            // set pivot to opposite corner (convert world -> local)
             const localOpp = worldToLocalPoint(pathIndex, oppositeX, oppositeY);
 
-            // no-jump pivot change
             const before = applyPathTransformToPoint(pathIndex, localOpp.x, localOpp.y);
             t.pivotX = localOpp.x;
             t.pivotY = localOpp.y;
@@ -2511,9 +2636,7 @@ canvas.addEventListener("pointerdown", (e) => {
           }
         }
 
-        // snapshot AFTER pivot is set
         svgInitialState = { ...pathTransformations[pathIndex] };
-
         clickedOnSomething = true;
         draw();
         return;
@@ -2542,17 +2665,22 @@ canvas.addEventListener("pointerdown", (e) => {
       }
     }
 
-    // Select a new path by stroke (ANY layer can be selected)
+    // Select a new path by stroke (ANY layer can be selected), but NOT locked layers
     if (!clickedOnSomething) {
-      const hit = pickTopmostPathAcrossLayers(p);
+      let hit = pickTopmostPathAcrossLayers(p);
+
+      // ✅ LOCK: ignore locked layer hits
+      if (hit && isLocked(hit.layerIndex)) hit = null;
 
       if (hit) {
-        // Activate the layer you clicked on (Flash behavior)
         window.timelineSetActiveLayer?.(hit.layerIndex);
-
-        // onTimelineChanged will load that layer/frame into penToolState.paths + pathTransformations.
-        // But to be safe (in case you ever remove the callback), we force-load too:
         window.onTimelineChanged?.(window.timelineCurrentFrame || 1, hit.layerIndex);
+
+        // ✅ after activating, if layer locked, do not select
+        if (isLocked(hit.layerIndex)) {
+          draw();
+          return;
+        }
 
         isSvgSelected = true;
         selectedSvgGroup = hit.pathIndex;
@@ -3160,9 +3288,7 @@ function drawMarquee() {
 // ===============================
 // Wheel zoom
 // ===============================
-canvas.addEventListener(
-  "wheel",
-  (e) => {
+canvas.addEventListener("wheel", (e) => {
     e.preventDefault();
 
     const mousePos = getCanvasMousePos(e);
@@ -3227,7 +3353,7 @@ document.addEventListener("keydown", (e) => {
     }
   }
 
-  if (activeTool === "subselection" && (e.key === "Delete" || e.key === "Backspace")) {
+  if (activeTool === "subselection" && (e.key === "Delete")) {
     if (selectedPath !== null && selectedAnchor !== null) {
       const path = penToolState.paths[selectedPath];
 
@@ -3252,17 +3378,21 @@ document.addEventListener("keydown", (e) => {
         draw();
       }
     } else if (selectedPath !== null && selectedAnchor === null) {
-      penToolState.paths.splice(selectedPath, 1);
-      pathTransformations.splice(selectedPath, 1);
-      selectedPath = null;
+      penToolState.paths.splice(selectedSvgGroup, 1);
+      pathTransformations.splice(selectedSvgGroup, 1);
 
-      syncPickerGlobals();
-      window.flashColorPickerSyncFromSelection?.();
+      isSvgSelected = false;
+      selectedSvgGroup = null;
+
+      // ✅ HERE (after splice, before draw)
+      const { frame, layerIndex } = commitActiveSvgToTimelineStore();
+      window.timelineRecomputeDot?.(frame, layerIndex);
+
       draw();
     }
   }
 
-  if (activeTool === "selection" && (e.key === "Delete" || e.key === "Backspace")) {
+  if (activeTool === "selection" && (e.key === "Delete")) {
     // ✅ Delete selected image instance (does NOT delete library asset)
     if (isImageSelected && selectedImageInstanceId) {
       window.stageDeleteImageInstance?.(selectedImageInstanceId);
@@ -3275,11 +3405,15 @@ document.addEventListener("keydown", (e) => {
     if (isSvgSelected && selectedSvgGroup !== null) {
       penToolState.paths.splice(selectedSvgGroup, 1);
       pathTransformations.splice(selectedSvgGroup, 1);
+
       isSvgSelected = false;
       selectedSvgGroup = null;
-
       syncPickerGlobals();
       window.flashColorPickerSyncFromSelection?.();
+
+      // ✅ NEW: save updated SVG state into timelineStore and recompute dot
+      const { frame, layerIndex } = commitActiveSvgToTimelineStore();
+      window.timelineRecomputeDot?.(frame, layerIndex); // or recomputeTimelineDot(frame, layerIndex)
 
       draw();
     }
