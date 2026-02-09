@@ -21,8 +21,8 @@ const ovalTool = document.getElementById("ovalTool");
 const stage = {
   x: 0,
   y: 0,
-  width: 1920,
-  height: 1080,
+  width: 800,
+  height: 600,
   bg: "#ffffff",
 };
 
@@ -60,19 +60,24 @@ function centerStageInView(dpr = 1) {
 
 function resizeCanvasToViewport() {
   const rect = canvasContainer.getBoundingClientRect();
-
-  // Optional: crisp rendering on HiDPI screens
   const dpr = window.devicePixelRatio || 1;
 
-  // Set the internal pixel buffer size
+  // Set internal pixel buffer size
   canvas.width = Math.floor(rect.width * dpr);
   canvas.height = Math.floor(rect.height * dpr);
 
-  // Make the canvas visually match the container size
+  // Visual size
   canvas.style.width = rect.width + "px";
   canvas.style.height = rect.height + "px";
 
-  centerStageInView(dpr);
+  // ✅ DO NOT center here (this runs too early and can double-apply DPR)
+  // centerStageInView(dpr);
+
+  // ✅ Re-fit after resize, but defer to next frame so layout is stable
+  requestAnimationFrame(() => {
+    fitStageToViewport({ padding: 40 });
+    window.draw?.();
+  });
 }
 
 // ===============================
@@ -148,32 +153,34 @@ let isShiftKeyPressed = false;
 // Fit on screen
 // ===============================
 function fitStageToViewport({ padding = 40 } = {}) {
-  const container = document.querySelector(".canvas-container");
-  if (!container || !window.stage || !window.view) return;
+  const cw = canvas.width;   // ✅ internal pixel size
+  const ch = canvas.height;
 
-  // Use the visible area in CSS pixels
-  const r = container.getBoundingClientRect();
-  const availW = Math.max(1, r.width - padding * 2);
-  const availH = Math.max(1, r.height - padding * 2);
+  const sw = stage.width;
+  const sh = stage.height;
 
-  const sw = window.stage.width || 1920;
-  const sh = window.stage.height || 1080;
+  if (!cw || !ch || !sw || !sh) return;
 
-  // Fit scale (keep aspect)
-  const s = Math.min(availW / sw, availH / sh);
+  const pad = Math.max(0, padding | 0);
 
-  // Set zoom
-  window.view.scale = s;
+  // scale so stage fits inside canvas with padding
+  const scaleX = (cw - pad * 2) / sw;
+  const scaleY = (ch - pad * 2) / sh;
+  const s = Math.min(scaleX, scaleY);
 
-  // Center stage in container
-  const cx = r.width * 0.5;
-  const cy = r.height * 0.5;
+  // avoid NaN/negative
+  view.scale = Number.isFinite(s) && s > 0 ? s : 1;
 
-  // screen = stage*scale + offset  => offset = screen - stage*scale
-  window.view.offsetX = cx - (sw * s) * 0.5;
-  window.view.offsetY = cy - (sh * s) * 0.5;
+  // ✅ center stage inside canvas
+  // stage.x/y is 0 in your app, but keep formula correct anyway
+  const stageLeftPx = stage.x * view.scale;
+  const stageTopPx = stage.y * view.scale;
 
-  window.draw?.();
+  const stageWpx = sw * view.scale;
+  const stageHpx = sh * view.scale;
+
+  view.offsetX = (cw - stageWpx) / 2 - stageLeftPx;
+  view.offsetY = (ch - stageHpx) / 2 - stageTopPx;
 }
 
 // ===============================
@@ -3507,6 +3514,14 @@ document.addEventListener("keyup", (e) => {
 // Init
 // ===============================
 resizeCanvasToViewport();
+
+// ✅ wait for layout + canvas sizing to fully settle
+requestAnimationFrame(() => {
+  requestAnimationFrame(() => {
+    fitStageToViewport({ padding: 40 });
+    draw?.();
+  });
+});
 
 // ✅ initialize editor to (frame 1, layer 0)
 loadTimelineFrameLayer(window.timelineCurrentFrame || 1, window.timelineGetActiveLayer?.() ?? 0);
