@@ -1,9 +1,3 @@
-// workspace.js (FULL UPDATED FILE)
-// NOTE: Only additions/changes are:
-// 1) syncPickerGlobals() function + initial call
-// 2) syncPickerGlobals() calls anywhere selection globals change
-// Everything else is your code as-is.
-
 // ===============================
 // Canvas + Context
 // ===============================
@@ -27,8 +21,8 @@ const ovalTool = document.getElementById("ovalTool");
 const stage = {
   x: 0,
   y: 0,
-  width: 800,
-  height: 600,
+  width: 1920,
+  height: 1080,
   bg: "#ffffff",
 };
 
@@ -149,6 +143,38 @@ let pathTransformations = []; // [{x,y,scaleX,scaleY,rotation,strokeWidth,pivotX
 // Key modifiers
 let isCtrlKeyPressed = false;
 let isShiftKeyPressed = false;
+
+// ===============================
+// Fit on screen
+// ===============================
+function fitStageToViewport({ padding = 40 } = {}) {
+  const container = document.querySelector(".canvas-container");
+  if (!container || !window.stage || !window.view) return;
+
+  // Use the visible area in CSS pixels
+  const r = container.getBoundingClientRect();
+  const availW = Math.max(1, r.width - padding * 2);
+  const availH = Math.max(1, r.height - padding * 2);
+
+  const sw = window.stage.width || 1920;
+  const sh = window.stage.height || 1080;
+
+  // Fit scale (keep aspect)
+  const s = Math.min(availW / sw, availH / sh);
+
+  // Set zoom
+  window.view.scale = s;
+
+  // Center stage in container
+  const cx = r.width * 0.5;
+  const cy = r.height * 0.5;
+
+  // screen = stage*scale + offset  => offset = screen - stage*scale
+  window.view.offsetX = cx - (sw * s) * 0.5;
+  window.view.offsetY = cy - (sh * s) * 0.5;
+
+  window.draw?.();
+}
 
 // ===============================
 // Svg delete
@@ -814,19 +840,18 @@ window.workspaceHasSvgAt = function workspaceHasSvgAt(frame, layerIndex) {
   const f = frame | 0;
   const l = layerIndex | 0;
 
-  // If we're asking about the CURRENT active frame/layer,
-  // also consider the live edit state (penToolState)
   const curF = window.timelineCurrentFrame ?? 1;
   const curL = window.timelineGetActiveLayer?.() ?? 0;
 
+  // If checking the currently active frame/layer, include live edit state
   if (f === (curF | 0) && l === (curL | 0)) {
-    if (window.penToolState?.paths && window.penToolState.paths.length > 0) return true;
-    // if penToolState isn't global in your file, remove "window." and just use penToolState
+    if (penToolState?.paths && penToolState.paths.length > 0) return true;
   }
 
-  // Saved keyframe SVG in timelineStore
+  // Otherwise check saved keyframe data
   const fr = window.timelineStore?.layers?.[l]?.frames?.[String(f)];
-  return !!(fr && Array.isArray(fr.paths) && fr.paths.length > 0);
+  const paths = fr?.paths;
+  return Array.isArray(paths) && paths.length > 0;
 };
 
 // ===============================
@@ -2308,6 +2333,14 @@ canvas.addEventListener("pointerdown", (e) => {
     if (hit && isLocked(hit.layerIndex)) hit = null;
 
     if (hit) {
+      // ✅ single-select: kill image selection if any
+      isImageSelected = false;
+      selectedImageInstanceId = null;
+      isImgDragging = false;
+      isImgScaling = false;
+      isImgRotating = false;
+      activeImgScaleHandle = 0;
+
       // Flash: clicking anything activates that layer
       window.timelineSetActiveLayer?.(hit.layerIndex);
       window.onTimelineChanged?.(window.timelineCurrentFrame || 1, hit.layerIndex);
@@ -2516,7 +2549,139 @@ canvas.addEventListener("pointerdown", (e) => {
       }
     }
 
-    // ✅ FIRST: image selection (images are drawn on top of vectors)
+    clickStartPos = { x: mousePos.x, y: mousePos.y };
+    let clickedOnSomething = false;
+
+    // ✅ IMPORTANT CHANGE:
+    // Handle checks for current SVG selection FIRST (so its anchors win over images above it)
+    if (isSvgSelected && selectedSvgGroup !== null && !isLocked(window.timelineGetActiveLayer?.() ?? 0)) {
+      const pathIndex = selectedSvgGroup;
+
+      if (isPointNearRotationHandle(p, pathIndex)) {
+        // ✅ single-select: kill image selection so it doesn't steal clicks
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
+
+        isSvgRotating = true;
+        isSvgDragging = false;
+        isSvgScaling = false;
+        svgDragStart = { x: p.x, y: p.y };
+
+        const t = pathTransformations[pathIndex];
+        if (t) {
+          const local = getLocalBBox(pathIndex);
+          if (local) {
+            const newPivotX = local.centerX;
+            const newPivotY = local.centerY;
+
+            const before = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
+            t.pivotX = newPivotX;
+            t.pivotY = newPivotY;
+            const after = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
+
+            t.x = (t.x ?? 0) + (before.x - after.x);
+            t.y = (t.y ?? 0) + (before.y - after.y);
+          }
+        }
+
+        svgInitialState = { ...pathTransformations[pathIndex] };
+        clickedOnSomething = true;
+        draw();
+        return;
+      }
+
+      const scaleHandle = isPointNearScaleHandle(p, pathIndex);
+      if (scaleHandle > 0) {
+        // ✅ single-select: kill image selection
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
+
+        isSvgScaling = true;
+        isSvgDragging = false;
+        isSvgRotating = false;
+        activeScaleHandle = scaleHandle;
+        svgDragStart = { x: p.x, y: p.y };
+
+        if (!pathTransformations[pathIndex]) initializePathTransform(pathIndex);
+        const t = pathTransformations[pathIndex];
+        if (t) {
+          const bbox = getPathBoundingBox(pathIndex);
+          if (bbox) {
+            let oppositeX, oppositeY;
+
+            switch (scaleHandle) {
+              case 1: oppositeX = bbox.x + bbox.width;  oppositeY = bbox.y + bbox.height; break;
+              case 2: oppositeX = bbox.x;               oppositeY = bbox.y + bbox.height; break;
+              case 3: oppositeX = bbox.x;               oppositeY = bbox.y;               break;
+              case 4: oppositeX = bbox.x + bbox.width;  oppositeY = bbox.y;               break;
+            }
+
+            const localOpp = worldToLocalPoint(pathIndex, oppositeX, oppositeY);
+
+            const before = applyPathTransformToPoint(pathIndex, localOpp.x, localOpp.y);
+            t.pivotX = localOpp.x;
+            t.pivotY = localOpp.y;
+            const after = applyPathTransformToPoint(pathIndex, localOpp.x, localOpp.y);
+
+            t.x = (t.x ?? 0) + (before.x - after.x);
+            t.y = (t.y ?? 0) + (before.y - after.y);
+          }
+        }
+
+        svgInitialState = { ...pathTransformations[pathIndex] };
+        clickedOnSomething = true;
+        draw();
+        return;
+      }
+
+      if (isPointNearCenterHandle(p, pathIndex)) {
+        // ✅ single-select: kill image selection
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
+
+        isSvgDragging = true;
+        isSvgScaling = false;
+        isSvgRotating = false;
+        svgDragStart = { x: p.x, y: p.y };
+        svgInitialState = { ...pathTransformations[pathIndex] };
+        clickedOnSomething = true;
+        draw();
+        return;
+      }
+
+      if (isPointOnPath(p, pathIndex)) {
+        // ✅ single-select: kill image selection
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
+
+        isSvgDragging = true;
+        isSvgScaling = false;
+        isSvgRotating = false;
+        svgDragStart = { x: p.x, y: p.y };
+        svgInitialState = { ...pathTransformations[pathIndex] };
+        clickedOnSomething = true;
+        draw();
+        return;
+      }
+    }
+
+    // ✅ NOW: image selection (moved AFTER svg-handle checks)
     let hitImg = pickTopmostImageInstance(p);
 
     // ✅ LOCK: ignore images on locked layers
@@ -2566,105 +2731,6 @@ canvas.addEventListener("pointerdown", (e) => {
       }
     }
 
-    clickStartPos = { x: mousePos.x, y: mousePos.y };
-    let clickedOnSomething = false;
-
-    // Handle checks for current selection (ONLY if active layer not locked)
-    if (isSvgSelected && selectedSvgGroup !== null && !isLocked(window.timelineGetActiveLayer?.() ?? 0)) {
-      const pathIndex = selectedSvgGroup;
-
-      if (isPointNearRotationHandle(p, pathIndex)) {
-        isSvgRotating = true;
-        isSvgDragging = false;
-        isSvgScaling = false;
-        svgDragStart = { x: p.x, y: p.y };
-
-        const t = pathTransformations[pathIndex];
-        if (t) {
-          const local = getLocalBBox(pathIndex);
-          if (local) {
-            const newPivotX = local.centerX;
-            const newPivotY = local.centerY;
-
-            const before = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
-            t.pivotX = newPivotX;
-            t.pivotY = newPivotY;
-            const after = applyPathTransformToPoint(pathIndex, newPivotX, newPivotY);
-
-            t.x = (t.x ?? 0) + (before.x - after.x);
-            t.y = (t.y ?? 0) + (before.y - after.y);
-          }
-        }
-
-        svgInitialState = { ...pathTransformations[pathIndex] };
-        clickedOnSomething = true;
-        draw();
-        return;
-      }
-
-      const scaleHandle = isPointNearScaleHandle(p, pathIndex);
-      if (scaleHandle > 0) {
-        isSvgScaling = true;
-        isSvgDragging = false;
-        isSvgRotating = false;
-        activeScaleHandle = scaleHandle;
-        svgDragStart = { x: p.x, y: p.y };
-
-        if (!pathTransformations[pathIndex]) initializePathTransform(pathIndex);
-        const t = pathTransformations[pathIndex];
-        if (t) {
-          const bbox = getPathBoundingBox(pathIndex);
-          if (bbox) {
-            let oppositeX, oppositeY;
-
-            switch (scaleHandle) {
-              case 1: oppositeX = bbox.x + bbox.width; oppositeY = bbox.y + bbox.height; break;
-              case 2: oppositeX = bbox.x;             oppositeY = bbox.y + bbox.height; break;
-              case 3: oppositeX = bbox.x;             oppositeY = bbox.y;               break;
-              case 4: oppositeX = bbox.x + bbox.width; oppositeY = bbox.y;              break;
-            }
-
-            const localOpp = worldToLocalPoint(pathIndex, oppositeX, oppositeY);
-
-            const before = applyPathTransformToPoint(pathIndex, localOpp.x, localOpp.y);
-            t.pivotX = localOpp.x;
-            t.pivotY = localOpp.y;
-            const after = applyPathTransformToPoint(pathIndex, localOpp.x, localOpp.y);
-
-            t.x = (t.x ?? 0) + (before.x - after.x);
-            t.y = (t.y ?? 0) + (before.y - after.y);
-          }
-        }
-
-        svgInitialState = { ...pathTransformations[pathIndex] };
-        clickedOnSomething = true;
-        draw();
-        return;
-      }
-
-      if (isPointNearCenterHandle(p, pathIndex)) {
-        isSvgDragging = true;
-        isSvgScaling = false;
-        isSvgRotating = false;
-        svgDragStart = { x: p.x, y: p.y };
-        svgInitialState = { ...pathTransformations[pathIndex] };
-        clickedOnSomething = true;
-        draw();
-        return;
-      }
-
-      if (isPointOnPath(p, pathIndex)) {
-        isSvgDragging = true;
-        isSvgScaling = false;
-        isSvgRotating = false;
-        svgDragStart = { x: p.x, y: p.y };
-        svgInitialState = { ...pathTransformations[pathIndex] };
-        clickedOnSomething = true;
-        draw();
-        return;
-      }
-    }
-
     // Select a new path by stroke (ANY layer can be selected), but NOT locked layers
     if (!clickedOnSomething) {
       let hit = pickTopmostPathAcrossLayers(p);
@@ -2681,6 +2747,14 @@ canvas.addEventListener("pointerdown", (e) => {
           draw();
           return;
         }
+
+        // ✅ single-select: kill image selection
+        isImageSelected = false;
+        selectedImageInstanceId = null;
+        isImgDragging = false;
+        isImgScaling = false;
+        isImgRotating = false;
+        activeImgScaleHandle = 0;
 
         isSvgSelected = true;
         selectedSvgGroup = hit.pathIndex;
@@ -3311,7 +3385,7 @@ canvas.addEventListener("wheel", (e) => {
 );
 
 window.addEventListener("resize", () => {
-  resizeCanvasToViewport();
+  fitStageToViewport({ padding: 40 });
   draw();
 });
 
