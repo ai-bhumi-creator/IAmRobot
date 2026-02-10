@@ -24,6 +24,8 @@ const stage = {
   width: 800,
   height: 600,
   bg: "#ffffff",
+  fps: 24,           // timeline playback rate
+  units: "px",       // "px" | "pt" | "in" | "cm" | "mm"
 };
 
 // ===============================
@@ -283,13 +285,20 @@ window.onTimelineLayerAdded = (newLayerIndex) => {
 function syncPickerGlobals() {
   window.penToolState = penToolState;
 
-  // subselection selection
   window.selectedPath = selectedPath;
 
-  // selection tool "SVG" selection (your path-group selection)
   window.selectedSvgGroup = selectedSvgGroup;
   window.isSvgSelected = isSvgSelected;
+
+  // ✅ ADD THESE (image selection)
+  window.isImageSelected = isImageSelected;
+  window.selectedImageInstanceId = selectedImageInstanceId;
+
+  // (optional but helpful)
+  window.getImageInstanceById = getImageInstanceById;
+  window.getImageBBoxWorld = getImageBBoxWorld;
 }
+
 // call once at start
 syncPickerGlobals();
 
@@ -1127,7 +1136,7 @@ function draw() {
     drawSvgSelection();
   }
 
-  if (activeTool === "selection" && isImageSelected && selectedImageInstanceId) {
+  if (activeTool === "selection" && isImageSelected && selectedImageInstanceId != null) {
     drawImageSelection();
   }
 
@@ -1365,7 +1374,7 @@ function drawSvgSelection() {
 }
 
 function drawImageSelection() {
-  if (!isImageSelected || !selectedImageInstanceId) return;
+  if (!isImageSelected || selectedImageInstanceId == null) return;
 
   const inst = getImageInstanceById(selectedImageInstanceId);
   if (!inst) return;
@@ -2495,7 +2504,7 @@ canvas.addEventListener("pointerdown", (e) => {
     const p = screenToStage(mousePos.x, mousePos.y);
 
     // ✅ If selected image belongs to locked layer, disable image editing
-    if (isImageSelected && selectedImageInstanceId) {
+    if (isImageSelected && selectedImageInstanceId != null) {
       const instSel = getImageInstanceById(selectedImageInstanceId);
       if (instSel && isLocked(instSel.layerIndex ?? activeLayerNow)) {
         isImageSelected = false;
@@ -2504,6 +2513,9 @@ canvas.addEventListener("pointerdown", (e) => {
         isImgScaling = false;
         isImgRotating = false;
         activeImgScaleHandle = 0;
+
+        syncPickerGlobals();
+        updatePropertiesPanel?.();
       }
     }
 
@@ -2518,7 +2530,7 @@ canvas.addEventListener("pointerdown", (e) => {
     }
 
     // ✅ 0) If an image is already selected, allow clicking its handles even outside the image
-    if (isImageSelected && selectedImageInstanceId) {
+    if (isImageSelected && selectedImageInstanceId != null) {
       const instSel = getImageInstanceById(selectedImageInstanceId);
       if (instSel && !isLocked(instSel.layerIndex ?? activeLayerNow)) {
         if (isPointNearImageRotationHandle(p, instSel)) {
@@ -2704,6 +2716,9 @@ canvas.addEventListener("pointerdown", (e) => {
       isImageSelected = true;
       selectedImageInstanceId = hitImg.id;
 
+      syncPickerGlobals();
+      updatePropertiesPanel?.();
+
       // handle checks
       if (isPointNearImageRotationHandle(p, hitImg)) {
         isImgRotating = true;
@@ -2861,7 +2876,7 @@ canvas.addEventListener("pointermove", (e) => {
   // ===============================
 // Image transform drag/scale/rotate (Selection tool)
 // ===============================
-if (activeTool === "selection" && (isImgDragging || isImgScaling || isImgRotating) && selectedImageInstanceId) {
+if (activeTool === "selection" && (isImgDragging || isImgScaling || isImgRotating) && selectedImageInstanceId != null) {
   const inst = getImageInstanceById(selectedImageInstanceId);
   if (!inst || !imgInitialState) return;
 
@@ -2912,6 +2927,8 @@ if (activeTool === "selection" && (isImgDragging || isImgScaling || isImgRotatin
       inst.scaleY = Math.max(0.1, (imgInitialState.scaleY || 1) * sfy);
     }
   }
+
+  updatePropertiesPanel?.();
 
   draw();
   return;
@@ -3242,6 +3259,8 @@ canvas.addEventListener("pointerup", (e) => {
     isImgRotating = false;
     activeImgScaleHandle = 0;
 
+    updatePropertiesPanel?.();
+
     isPotentialMarquee = false;
 
     if (isMarquee) {
@@ -3475,7 +3494,7 @@ document.addEventListener("keydown", (e) => {
 
   if (activeTool === "selection" && (e.key === "Delete")) {
     // ✅ Delete selected image instance (does NOT delete library asset)
-    if (isImageSelected && selectedImageInstanceId) {
+    if (isImageSelected && selectedImageInstanceId != null) {
       window.stageDeleteImageInstance?.(selectedImageInstanceId);
       isImageSelected = false;
       selectedImageInstanceId = null;
@@ -3496,6 +3515,7 @@ document.addEventListener("keydown", (e) => {
       const { frame, layerIndex } = commitActiveSvgToTimelineStore();
       window.timelineRecomputeDot?.(frame, layerIndex); // or recomputeTimelineDot(frame, layerIndex)
 
+      updatePropertiesPanel?.();
       draw();
     }
   }
