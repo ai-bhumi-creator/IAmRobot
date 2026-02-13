@@ -137,6 +137,11 @@ let isCtrlKeyPressed = false;
 let isShiftKeyPressed = false;
 
 // ===============================
+// Marquee (box) selection state
+// ===============================
+let marquee = null; // { start:{x,y}, end:{x,y} } in WORLD coords
+
+// ===============================
 // Stage centre on viewport
 // ===============================
 function centerStageInView(dpr = 1) {
@@ -3536,6 +3541,12 @@ canvas.addEventListener("pointermove", (e) => {
   const mousePos = getCanvasMousePos(e);
   const mousePoint = screenToStage(mousePos.x, mousePos.y);
 
+  if (marquee) {
+    marquee.end = screenToWorld(e.clientX, e.clientY);
+    window.draw?.();
+    return;
+  }
+
   // ===============================
   // Image transform drag/scale/rotate (Selection tool)
   // ===============================
@@ -4340,5 +4351,6 @@ window.screenToStage = screenToStage;
 
 window.timelineRefreshFromStore?.();
 
-draw();
+window.multiSelectedPaths = window.multiSelectedPaths || [];
 
+draw();
