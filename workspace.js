@@ -137,11 +137,6 @@ let isCtrlKeyPressed = false;
 let isShiftKeyPressed = false;
 
 // ===============================
-// Marquee (box) selection state
-// ===============================
-let marquee = null; // { start:{x,y}, end:{x,y} } in WORLD coords
-
-// ===============================
 // Stage centre on viewport
 // ===============================
 function centerStageInView(dpr = 1) {
@@ -205,60 +200,6 @@ function fitStageToViewport({ padding = 40 } = {}) {
   view.offsetX = (cw - stageWpx) / 2 - stageLeftPx;
   view.offsetY = (ch - stageHpx) / 2 - stageTopPx;
 }
-
-// ===============================
-// Selection State (multi-select)
-// ===============================
-const selectionState = {
-  indices: new Set(),   // selected path indices
-  primary: null,        // main selected index (keeps existing behavior)
-};
-
-function selectionSet(indices, primary = null) {
-  selectionState.indices.clear();
-  indices.forEach(i => selectionState.indices.add(i));
-  selectionState.primary = (primary != null) ? primary : (indices.length ? indices[0] : null);
-
-  // Keep your existing globals compatible
-  window.isSvgSelected = selectionState.primary != null;
-  window.selectedPath = selectionState.primary; // subselection/color picker uses this
-  window.selectedSvgGroup = selectionState.primary; // if your selection tool expects number
-  window.selectedPathId = null;
-  window.selectedSvgId = null;
-
-  window.draw?.();
-  window.flashColorPickerSyncFromSelection?.();
-}
-
-function selectionClear() {
-  selectionState.indices.clear();
-  selectionState.primary = null;
-
-  window.isSvgSelected = false;
-  window.selectedPath = null;
-  window.selectedSvgGroup = null;
-
-  window.draw?.();
-  window.flashColorPickerSyncFromSelection?.();
-}
-
-// Expose for menu.js + other code
-window.workspaceSelectAll = function workspaceSelectAll() {
-  const paths = window.penToolState?.paths || [];
-  const indices = [];
-  for (let i = 0; i < paths.length; i++) {
-    if (paths[i]) indices.push(i);
-  }
-  selectionSet(indices, indices.length ? indices[0] : null);
-};
-
-window.workspaceClearSelection = selectionClear;
-
-// Optional: expose selection for debugging
-window.workspaceGetSelection = () => ({
-  primary: selectionState.primary,
-  indices: Array.from(selectionState.indices),
-});
 
 // ===============================
 // Grid helpers
@@ -618,19 +559,6 @@ function screenToStage(mx, my) {
     x: (mx - view.offsetX) / view.scale,
     y: (my - view.offsetY) / view.scale,
   };
-}
-
-function rectNorm(a, b) {
-  const x1 = Math.min(a.x, b.x);
-  const y1 = Math.min(a.y, b.y);
-  const x2 = Math.max(a.x, b.x);
-  const y2 = Math.max(a.y, b.y);
-  return { x1, y1, x2, y2 };
-}
-
-function rectIntersectsBBox(r, b) {
-  // b expected: {xMin, yMin, xMax, yMax} (adjust if your bbox uses different names)
-  return !(r.x2 < b.xMin || r.x1 > b.xMax || r.y2 < b.yMin || r.y1 > b.yMax);
 }
 
 function getMarqueeRect(a, b) {
@@ -3541,12 +3469,6 @@ canvas.addEventListener("pointermove", (e) => {
   const mousePos = getCanvasMousePos(e);
   const mousePoint = screenToStage(mousePos.x, mousePos.y);
 
-  if (marquee) {
-    marquee.end = screenToWorld(e.clientX, e.clientY);
-    window.draw?.();
-    return;
-  }
-
   // ===============================
   // Image transform drag/scale/rotate (Selection tool)
   // ===============================
@@ -4350,7 +4272,5 @@ window.drawAllLayersAtCurrentFrame = drawAllLayersAtCurrentFrame;
 window.screenToStage = screenToStage;
 
 window.timelineRefreshFromStore?.();
-
-window.multiSelectedPaths = window.multiSelectedPaths || [];
 
 draw();
