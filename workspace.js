@@ -597,6 +597,28 @@ function clamp(v, lo, hi) {
   return Math.max(lo, Math.min(hi, v));
 }
 
+function clampStrokeW(v) {
+  v = Number(v);
+  if (!Number.isFinite(v)) v = 1;
+  return clamp(v, 0, 100);
+}
+
+function getStrokeWForPathIndex(pathIndex, pathOverride = null, tOverride = null) {
+  const path = pathOverride ?? window.penToolState?.paths?.[pathIndex];
+  const st = path?.style || {};
+  const def = window.flashCurrentStyle || {};
+
+  // priority: per-path style -> default style -> transform -> fallback
+  const raw =
+    st.strokeW ??
+    st.strokeWidth ??
+    def.strokeW ??
+    (tOverride?.strokeWidth ?? pathTransformations?.[pathIndex]?.strokeWidth) ??
+    2;
+
+  return clampStrokeW(raw);
+}
+
 function worldToLocalPoint(pathIndex, wx, wy) {
   const t = pathTransformations[pathIndex];
   if (!t) return { x: wx, y: wy };
@@ -935,7 +957,7 @@ function initializePathTransform(pathIndex) {
     scaleX: 1,
     scaleY: 1,
     rotation: 0,
-    strokeWidth: 2,
+    strokeWidth: getStrokeWForPathIndex(pathIndex),
     pivotX: local.centerX,
     pivotY: local.centerY,
   };
@@ -1117,7 +1139,7 @@ function getPathBoundingBox(pathIndex) {
     }
   }
 
-  const stroke = (t?.strokeWidth ?? 2) / view.scale;
+  const stroke = getStrokeWForPathIndex(pathIndex, null, t) / view.scale;
   const pad = stroke * 0.5;
   minX -= pad;
   minY -= pad;
@@ -1526,7 +1548,7 @@ function drawPaths() {
     if (!p2d) return;
 
     const t = pathTransformations[pathIndex];
-    const baseStrokeWidth = t ? t.strokeWidth : 2;
+    const baseStrokeWidth = getStrokeWForPathIndex(pathIndex, path, t);
     let lw = Math.max(0.5, baseStrokeWidth / view.scale);
 
     const isSelected =
@@ -1674,7 +1696,7 @@ function drawAllLayersAtCurrentFrame() {
       if (!p2d) return;
 
       const t = fr.transforms?.[pathIndex];
-      const baseStrokeWidth = t ? t.strokeWidth : 2;
+      const baseStrokeWidth = getStrokeWForPathIndex(pathIndex, path, t);
       const lw = Math.max(0.5, baseStrokeWidth / view.scale);
 
       const rs = getRenderStyleReadOnly(path);
@@ -4235,4 +4257,3 @@ window.screenToStage = screenToStage;
 window.timelineRefreshFromStore?.();
 
 draw();
-
