@@ -1,0 +1,493 @@
+void CanvasViewport::OnLeftDown(wxMouseEvent& event)
+{
+    if (!m_stage)
+        return;
+
+    const wxPoint mouseClient = event.GetPosition();
+    const wxPoint2DDouble stagePt = ClientToStage(mouseClient);
+
+    // Text tool: click to start editing overlay
+    if (!m_subselectionMode && m_textToolActive)
+    {
+        BeginTextEdit(mouseClient, stagePt);
+        return;
+    }
+
+    // Subselection tool to edit path objects
+    if (m_subselectionMode)
+    {
+        PathDisplayObject* path = GetSelectedPathObject();
+        if (path)
+        {
+            // RemoveAnchor: click an anchor to remove it.
+            // If path has 3 anchors (or fewer), remove whole path object.
+            if (m_subToolType == SubToolType::RemoveAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Anchor && clickHit.anchorIndex >= 0)
+                {
+                    const size_t count = path->GetAnchorCount();
+
+                    // Your rule: if path has 3 anchors and remove-anchor is used => delete whole path
+                    if (count <= 2)
+                    {
+                        // Remove the object from the active frame
+                        Layer* layer = m_doc ? m_doc->GetLayer(m_doc->GetActiveLayerIndex()) : nullptr;
+                        Frame* frame = layer ? layer->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+
+                        if (frame)
+                            frame->RemoveObject(path);
+
+                        if (m_doc)
+                            m_doc->ClearSelection();
+
+                        m_subselHover = {};
+                        m_selectedSegmentIndex = -1;
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                    else
+                    {
+                        // Remove only that anchor
+                        path->RemoveAnchor((size_t)clickHit.anchorIndex);
+
+                        // Reset hover/segment selection so indices don’t point to old anchors
+                        m_subselHover = {};
+                        m_selectedSegmentIndex = -1;
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                }
+            }
+
+            if (m_subToolType == SubToolType::EditAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Segment && clickHit.segmentIndex >= 0)
+                {
+                    m_selectedSegmentIndex = clickHit.segmentIndex;
+                    RefreshPropertiesFromMainFrame(this);
+                    Refresh(false);
+                    return;
+                }
+                else
+                {
+                    m_selectedSegmentIndex = -1; // clicked off segment
+                }
+            }
+
+            // AddAnchor: click on segment to split + insert new anchor
+            if (m_subToolType == SubToolType::AddAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Segment &&
+                    clickHit.segmentIndex >= 0)
+                {
+                    const int newAnchorIndex = path->InsertAnchorOnSegment(
+                        (size_t)clickHit.segmentIndex, clickHit.t);
+
+                    if (newAnchorIndex >= 0)
+                    {
+                        m_subselHover.type = PathSubselHitType::Anchor;
+                        m_subselHover.anchorIndex = newAnchorIndex;
+                        m_subselHover.segmentIndex = -1;
+
+                        m_isDraggingSubselAnchor = true;
+                        m_dragSubselAnchorIndex = newAnchorIndex;
+                        m_dragSubselLastLocalPos = path->WorldToLocal(stagePt);
+
+                        if (!HasCapture())
+                            CaptureMouse();
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                }
+            }
+
+            // Existing handle/anchor drags
+            if (m_subselHover.type == PathSubselHitType::InHandle && m_subselHover.anchorIndex >= 0)
+            {
+                m_isDraggingSubselHandle = true;
+                m_draggingInHandle = true;
+                m_dragSubselHandleAnchorIndex = m_subselHover.anchorIndex;
+
+                if (!HasCapture())
+                    CaptureMouse();
+
+                Refresh(false);
+                return;
+            }
+
+            if (m_subselHover.type == PathSubselHitType::OutHandle && m_subselHover.anchorIndex >= 0)
+            {
+                m_isDraggingSubselHandle = true;
+                m_draggingInHandle = false;
+                m_dragSubselHandleAnchorIndex = m_subselHover.anchorIndex;
+
+                if (!HasCapture())
+                    CaptureMouse();
+
+                Refresh(false);
+                return;
+            }
+
+            if (m_subselHover.type == PathSubselHitType::Anchor && m_subselHover.anchorIndex >= 0)
+            {
+                PathAnchor* anchor = path->GetAnchor((size_t)m_subselHover.anchorIndex);
+                if (anchor)
+                {
+                    m_isDraggingSubselAnchor = true;
+                    m_dragSubselAnchorIndex = m_subselHover.anchorIndex;
+                    m_dragSubselLastLocalPos = path->WorldToLocal(stagePt);
+
+                    if (!HasCapture())
+                        CaptureMouse();
+
+                    Refresh(false);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Start shape drawing (Line / Rectangle / Ellipse)
+    if (!m_subselectionMode && (m_lineToolActive || m_rectangleToolActive || m_ellipseToolActive))
+    {
+        m_isDrawingShape = true;
+        m_shapeStartStage = stagePt;
+        m_shapeCurrentStage = stagePt;
+
+        if (!HasCapture())
+            CaptureMouse();
+
+        Refresh(false);
+        return;
+    }
+
+    if (m_penToolActive)
+    {
+        const int hitIndex = HitTestPenPoint(stagePt);
+
+        if (hitIndex == 0 && m_penPoints.size() >= 3)
+        {
+            CompletePenPath();
+            Refresh(false);
+            return;
+        }
+
+        m_penPoints.push_back(stagePt);
+        m_hasPenHoverStagePos = true;
+        m_penHoverStagePos = stagePt;
+        m_penHoverPointIndex = HitTestPenPoint(stagePt);
+
+        Refresh(false);
+        return;
+    }
+
+    m_isDraggingObject  = false;
+    m_isScalingObject   = false;
+    m_isRotatingObject  = false;
+
+    double drawX = 0.0, drawY = 0.0;
+    GetStageDrawOrigin(drawX, drawY);
+
+    DisplayObject* selected = GetTransformTarget();
+    if (selected)
+    {
+        TransformGizmo& gizmo = m_doc->GetGizmo();
+        TransformGizmo::Handle handle = gizmo.HitTestHandles(mouseClient, drawX, drawY, m_zoom);
+
+        if (handle != TransformGizmo::Handle::None)
+        {
+            m_isScalingObject      = true;
+            m_activeHandle         = handle;
+            m_scaleStartMouseStage = stagePt;
+            m_scaleStartBounds     = selected->GetWorldBounds();
+            m_scaleStartPos        = selected->GetPosition();
+            m_scaleStartScale      = selected->GetScale();
+            m_scaleStartPivot      = selected->GetPivot();
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+
+        if (gizmo.IsInRotateZone(mouseClient, drawX, drawY, m_zoom))
+        {
+            m_isRotatingObject      = true;
+            m_rotateStartMouseStage = stagePt;
+            m_rotateStartDegrees    = selected->GetRotation();
+            const wxRect2DDouble bounds = selected->GetWorldBounds();
+            m_rotateCenterStage = wxPoint2DDouble(
+                bounds.m_x + bounds.m_width  * 0.5,
+                bounds.m_y + bounds.m_height * 0.5
+            );
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+
+        if (selected->HitTestWorld(stagePt))
+        {
+            m_isDraggingObject = true;
+            m_lastDragStagePos = stagePt;
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+    }
+
+    DisplayObject* hit = nullptr;
+    Layer* layer = m_doc->GetLayer(m_doc->GetActiveLayerIndex());
+    if (layer)
+    {
+        Frame* frame = layer->GetFrame(m_doc->GetCurrentFrame());
+        if (frame)
+            hit = frame->HitTestTop(stagePt);
+    }
+
+    // Start marquee only in Selection tool (no pen/shape/subselection/text)
+    if (!m_subselectionMode && !m_textToolActive && !IsDrawToolActive())
+    {
+        // Only start marquee if click is on empty space (no object hit)
+        DisplayObject* hit0 = nullptr;
+        Layer* layer0 = m_doc ? m_doc->GetLayer(m_doc->GetActiveLayerIndex()) : nullptr;
+        Frame* frame0 = layer0 ? layer0->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+        if (frame0)
+            hit0 = frame0->HitTestTop(stagePt);
+
+        if (!hit0)
+        {
+            m_isMarqueeSelecting = true;
+            m_marqueeStartClient = mouseClient;
+            m_marqueeCurrentClient = mouseClient;
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+    }
+
+    if (hit)
+    {
+        if (event.ShiftDown())
+        {
+            // Toggle membership in multi selection list
+            auto it = std::find(m_multiSel.begin(), m_multiSel.end(), hit);
+            if (it != m_multiSel.end())
+                m_multiSel.erase(it);
+            else
+                m_multiSel.push_back(hit);
+
+            // If multi (2+), build proxy + target gizmo to proxy
+            if (m_multiSel.size() >= 2)
+            {
+                RebuildGroupProxyFromMultiSel(); // sets gizmo target = proxy
+            }
+            else
+            {
+                // Back to single selection
+                ClearMultiSelection();
+                m_doc->Select(hit);
+            }
+        }
+        else
+        {
+            // Normal click: if clicking within existing multi selection, keep it
+            if (m_multiSel.size() >= 2)
+            {
+                if (std::find(m_multiSel.begin(), m_multiSel.end(), hit) == m_multiSel.end())
+                {
+                    // clicked a different object -> single selection
+                    ClearMultiSelection();
+                    m_doc->Select(hit);
+                }
+                else
+                {
+                    // clicked one of the selected -> keep group proxy as target
+                    RebuildGroupProxyFromMultiSel();
+                }
+            }
+            else
+            {
+                // Single selection normal
+                ClearMultiSelection();
+                m_doc->Select(hit);
+            }
+        }
+
+        // Start dragging (this will drag proxy if group active, else the selected object)
+        m_isDraggingObject = true;
+        m_lastDragStagePos = stagePt;
+
+        if (!HasCapture())
+            CaptureMouse();
+    }
+    else
+    {
+        // Click empty clears both
+        ClearMultiSelection();
+        m_doc->ClearSelection();
+    }
+
+    RefreshPropertiesFromMainFrame(this);
+    Refresh(false);
+}
+
+void CanvasViewport::OnLeftUp(wxMouseEvent& event)
+{
+    if (m_isMarqueeSelecting)
+    {
+        m_isMarqueeSelecting = false;
+        m_marqueeCurrentClient = event.GetPosition();
+
+        if (HasCapture() && !m_isPanning)
+            ReleaseMouse();
+
+        // --- FINISH MARQUEE: select objects intersecting rect ---
+        const wxRect2DDouble r = GetMarqueeStageRect();
+        const double tiny = 2.0 / ((m_zoom > 1e-6) ? m_zoom : 1.0);
+
+        const bool addToExisting = event.ShiftDown();
+
+        // If user just clicked empty (no real drag) => clear selection (Flash-like)
+        if (r.m_width < tiny && r.m_height < tiny)
+        {
+            if (!addToExisting)
+            {
+                ClearMultiSelection();
+                if (m_doc) m_doc->ClearSelection();
+            }
+
+            RefreshPropertiesFromMainFrame(this);
+            Refresh(false);
+            return;
+        }
+
+        // Collect hits from active frame (INTERSECT)
+        std::vector<DisplayObject*> hits;
+        if (m_doc)
+        {
+            Layer* layer = m_doc->GetLayer(m_doc->GetActiveLayerIndex());
+            Frame* frame = layer ? layer->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+
+            if (frame)
+            {
+                auto& objs = frame->GetObjects();
+                for (auto& up : objs)
+                {
+                    DisplayObject* o = up.get();
+                    if (!o || !o->IsVisible() || o->IsLocked())
+                        continue;
+
+                    if (o->GetWorldBounds().Intersects(r))
+                        hits.push_back(o);
+                }
+            }
+        }
+
+        if (!addToExisting)
+            ClearMultiSelection();
+
+        // Merge hits into m_multiSel (no duplicates)
+        for (DisplayObject* o : hits)
+        {
+            if (!o) continue;
+            if (std::find(m_multiSel.begin(), m_multiSel.end(), o) == m_multiSel.end())
+                m_multiSel.push_back(o);
+        }
+
+        // Apply result
+        if (m_multiSel.empty())
+        {
+            ClearMultiSelection();
+            if (m_doc) m_doc->ClearSelection();
+        }
+        else if (m_multiSel.size() == 1)
+        {
+            // single
+            if (m_doc) m_doc->Select(m_multiSel[0]);
+            ClearMultiSelection(); // keep single selection in Document
+        }
+        else
+        {
+            // group (2+)
+            RebuildGroupProxyFromMultiSel(); // sets gizmo target = proxy
+        }
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDrawingShape)
+    {
+        m_isDrawingShape = false;
+        CompleteShapePath();
+
+        if (HasCapture() && !m_isPanning)
+            ReleaseMouse();
+
+        return;
+    }
+
+    if (m_isDraggingSubselHandle)
+    {
+        m_isDraggingSubselHandle = false;
+        m_draggingInHandle = false;
+        m_dragSubselHandleAnchorIndex = -1;
+    }
+
+    if (m_isDraggingSubselAnchor)
+    {
+        m_isDraggingSubselAnchor = false;
+        m_dragSubselAnchorIndex = -1;
+    }
+
+    if (m_isDraggingObject)
+        m_isDraggingObject = false;
+
+    if (m_isScalingObject)
+    {
+        m_isScalingObject = false;
+        m_activeHandle = TransformGizmo::Handle::None;
+    }
+
+    if (m_isRotatingObject)
+        m_isRotatingObject = false;
+
+    if (HasCapture() && !m_isPanning)
+        ReleaseMouse();
+}
+
