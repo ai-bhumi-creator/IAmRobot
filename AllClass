@@ -1,1 +1,660 @@
+#pragma once
+#include <wx/wx.h>
+#include <wx/panel.h>
+#include <wx/textctrl.h>
+#include <wx/slider.h>
+#include <wx/colour.h>
+#include <wx/sizer.h>
+#include <wx/choice.h>
 
+class Document;
+class DisplayObject;
+
+class PropertiesPanel : public wxPanel
+{
+public:
+    PropertiesPanel(wxWindow* parent);
+
+    void SetZero();
+    void SetDashed();
+    void SetFields(double x, double y, double w, double h);
+
+    void SetTarget(Document* doc, DisplayObject* selected, int selectedSegmentIndex = -1);
+
+    // Current UI style (used as defaults for new paths)
+    wxColour GetCurrentFillColor() const { return GetPreviewColor(fillColorPreview); }
+    wxColour GetCurrentStrokeColor() const { return GetPreviewColor(strokeColorPreview); }
+    double GetCurrentStrokeWidth() const;
+
+    void UpdateSectionsForSelection(bool isPath, bool isText, bool isImage);
+
+private:
+    void SetPreviewColor(wxPanel* preview, const wxColour& c);
+    wxColour GetPreviewColor(wxPanel* preview) const;
+
+    void SetStrokeWidthUI(double v);
+
+    // UI only for now
+    void OnFillPreviewClick(wxMouseEvent& e);
+    void OnStrokePreviewClick(wxMouseEvent& e);
+    void OnStrokeSlider(wxCommandEvent& e);
+
+    // Sections
+    void BuildTransformSection(wxBoxSizer* root);
+    void BuildPathSection(wxBoxSizer* root);
+    void BuildTextSection(wxBoxSizer* root);
+    void BuildImageSection(wxBoxSizer* root);
+
+    void OnTextColorPreviewClick(wxMouseEvent& event);
+
+private:
+    wxPanel* m_transformSection = nullptr;   // always visible
+    wxPanel* m_pathSection = nullptr;        // only for path
+    wxPanel* m_textSection = nullptr;        // only for text
+    wxPanel* m_imageSection = nullptr;       // optional later
+
+    Document* m_doc = nullptr;
+    DisplayObject* m_selected = nullptr;
+
+    wxTextCtrl* xCtrl = nullptr;
+    wxTextCtrl* yCtrl = nullptr;
+    wxTextCtrl* wCtrl = nullptr;
+    wxTextCtrl* hCtrl = nullptr;
+
+    wxPanel* fillColorPreview = nullptr;
+    wxPanel* strokeColorPreview = nullptr;
+
+    wxSlider* strokeWidthSlider = nullptr;
+    wxTextCtrl* strokeWidthCtrl = nullptr;
+
+    int m_selectedSegmentIndex = -1;
+
+    // Text section
+    wxChoice* textFamilyChoice = nullptr;
+    wxChoice* textStyleChoice = nullptr;
+
+    wxTextCtrl* textSizeCtrl = nullptr;
+    wxTextCtrl* textLetterSpacingCtrl = nullptr;
+
+    wxPanel* textColorPreview = nullptr;
+    wxCheckBox* textAutoKernCheck = nullptr;
+};
+======================================================================================
+#include <algorithm>
+#include <wx/stattext.h>
+#include <wx/textctrl.h>
+#include <wx/statline.h>
+#include <wx/colordlg.h>
+#include <wx/settings.h>
+#include <wx/fontenum.h>
+
+#include "PropertiesPanel.h"
+#include "Document.h"
+#include "DisplayObject.h"
+#include "PathDisplayObject.h"
+
+static wxArrayString GetSystemFontFaceNames()
+{
+    wxFontEnumerator enumerator;
+    wxArrayString fonts = enumerator.GetFacenames();
+
+    fonts.Sort();
+
+    wxArrayString filtered;
+    filtered.Alloc(fonts.size());
+
+    wxString lastAddedLower;
+
+    for (const auto& name : fonts)
+    {
+        wxString cleanName = name;
+        cleanName.Trim(true);
+        cleanName.Trim(false);
+
+        if (cleanName.IsEmpty())
+            continue;
+
+        const wxString lower = cleanName.Lower();
+
+        if (filtered.IsEmpty() || lower != lastAddedLower)
+        {
+            filtered.Add(cleanName);
+            lastAddedLower = lower;
+        }
+    }
+
+    return filtered;
+}
+
+static PathDisplayObject* AsPath(DisplayObject* o)
+{
+    if (!o) return nullptr;
+    if (o->GetType() != DisplayObjectType::Path) return nullptr;
+    return static_cast<PathDisplayObject*>(o);
+}
+
+static void RefreshUp(wxWindow* w)
+{
+    // simple + reliable: repaint up the parent chain
+    wxWindow* p = w;
+    while (p)
+    {
+        p->Refresh(false);
+        p = p->GetParent();
+    }
+}
+
+static wxTextCtrl* MakeReadOnly(wxWindow* parent)
+{
+    return new wxTextCtrl(parent, wxID_ANY, "", wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+}
+
+static wxString F(double v)
+{
+    return wxString::Format("%.2f", v);
+}
+
+PropertiesPanel::PropertiesPanel(wxWindow* parent)
+    : wxPanel(parent)
+{
+    auto* root = new wxBoxSizer(wxVERTICAL);
+
+    BuildTransformSection(root);
+    BuildPathSection(root);
+    BuildTextSection(root);
+    BuildImageSection(root);
+
+    SetSizer(root);
+    SetMinSize(wxSize(340, -1));
+
+    // Default preview colors
+    SetPreviewColor(fillColorPreview, *wxWHITE);
+    SetPreviewColor(strokeColorPreview, *wxBLACK);
+    SetStrokeWidthUI(2.0);
+
+    // UI only
+    fillColorPreview->Bind(wxEVT_LEFT_DOWN, &PropertiesPanel::OnFillPreviewClick, this);
+    strokeColorPreview->Bind(wxEVT_LEFT_DOWN, &PropertiesPanel::OnStrokePreviewClick, this);
+    strokeWidthSlider->Bind(wxEVT_SLIDER, &PropertiesPanel::OnStrokeSlider, this);
+
+    if (textColorPreview)
+        textColorPreview->Bind(wxEVT_LEFT_DOWN, &PropertiesPanel::OnTextColorPreviewClick, this);
+
+    SetZero();
+
+    // Initial visibility
+    UpdateSectionsForSelection(false, false, false);
+
+    Layout();
+}
+
+void PropertiesPanel::SetPreviewColor(wxPanel* preview, const wxColour& c)
+{
+    if (!preview)
+        return;
+
+    preview->SetBackgroundColour(c);
+    preview->Refresh();
+}
+
+wxColour PropertiesPanel::GetPreviewColor(wxPanel* preview) const
+{
+    if (!preview)
+        return *wxBLACK;
+
+    return preview->GetBackgroundColour();
+}
+
+void PropertiesPanel::SetStrokeWidthUI(double v)
+{
+    v = std::clamp(v, 0.0, 50.0);
+
+    if (strokeWidthSlider)
+        strokeWidthSlider->SetValue((int)std::round(v * 10.0));
+
+    if (strokeWidthCtrl)
+        strokeWidthCtrl->SetValue(wxString::Format("%.2f", v));
+}
+
+void PropertiesPanel::SetZero()
+{
+    xCtrl->SetValue("0");
+    yCtrl->SetValue("0");
+    wCtrl->SetValue("0");
+    hCtrl->SetValue("0");
+
+    //SetPreviewColor(fillColorPreview, *wxWHITE);
+    //SetPreviewColor(strokeColorPreview, *wxBLACK);
+    //SetStrokeWidthUI(2.0);
+}
+
+void PropertiesPanel::SetDashed()
+{
+    xCtrl->SetValue("--");
+    yCtrl->SetValue("--");
+    wCtrl->SetValue("--");
+    hCtrl->SetValue("--");
+
+    if (strokeWidthCtrl)
+        strokeWidthCtrl->SetValue("--");
+}
+
+void PropertiesPanel::SetFields(double x, double y, double w, double h)
+{
+    xCtrl->SetValue(F(x));
+    yCtrl->SetValue(F(y));
+    wCtrl->SetValue(F(w));
+    hCtrl->SetValue(F(h));
+}
+
+void PropertiesPanel::SetTarget(Document* doc, DisplayObject* selected, int selectedSegmentIndex)
+{
+    m_doc = doc;
+    m_selected = selected;
+    m_selectedSegmentIndex = selectedSegmentIndex;
+
+    if (!m_selected)
+    {
+        SetZero();
+        return;
+    }
+
+    const wxPoint2DDouble pos   = m_selected->GetPosition();
+    const wxPoint2DDouble scale = m_selected->GetScale();
+    const wxRect2DDouble  local = m_selected->GetLocalBounds();
+
+    const double w = local.m_width  * std::abs(scale.m_x);
+    const double h = local.m_height * std::abs(scale.m_y);
+
+    SetFields(pos.m_x, pos.m_y, w, h);
+
+    if (m_selected->GetType() == DisplayObjectType::Path)
+    {
+        PathDisplayObject* path = static_cast<PathDisplayObject*>(m_selected);
+
+        SetPreviewColor(fillColorPreview, path->GetFillColor());
+
+        if (m_selectedSegmentIndex >= 0 && m_selectedSegmentIndex < (int)path->GetSegmentCount())
+        {
+            const PathSegment* seg = path->GetSegment((size_t)m_selectedSegmentIndex);
+            if (seg)
+                SetPreviewColor(strokeColorPreview, seg->style.strokeColor);
+            else
+                SetPreviewColor(strokeColorPreview, path->GetStrokeColor());
+        }
+        else
+        {
+            SetPreviewColor(strokeColorPreview, path->GetStrokeColor());
+        }
+
+        SetStrokeWidthUI(path->GetStrokeWidth());
+    }
+    else
+    {
+        // Image and other object types for now
+        SetPreviewColor(fillColorPreview, *wxWHITE);
+        SetPreviewColor(strokeColorPreview, *wxBLACK);
+        SetStrokeWidthUI(2.0);
+    }
+}
+
+void PropertiesPanel::OnFillPreviewClick(wxMouseEvent& e)
+{
+    wxColourData data;
+    data.SetChooseFull(true);
+    data.SetColour(GetPreviewColor(fillColorPreview));
+
+#if wxCHECK_VERSION(3, 1, 0)
+    data.SetChooseAlpha(true); // enables transparency slider where supported
+#endif
+
+    wxColourDialog dlg(this, &data);
+    if (dlg.ShowModal() == wxID_OK)
+    {
+        const wxColour c = dlg.GetColourData().GetColour(); // may include alpha
+        SetPreviewColor(fillColorPreview, c);
+
+        if (PathDisplayObject* path = AsPath(m_selected))
+        {
+            path->SetFillColor(c);  // fill color + alpha
+            RefreshUp(this);
+        }
+    }
+
+    e.Skip();
+}
+
+void PropertiesPanel::OnStrokePreviewClick(wxMouseEvent& e)
+{
+    wxColourData data;
+    data.SetChooseFull(true);
+    data.SetColour(GetPreviewColor(strokeColorPreview));
+
+#if wxCHECK_VERSION(3, 1, 0)
+    data.SetChooseAlpha(true); // enables transparency slider where supported
+#endif
+
+    wxColourDialog dlg(this, &data);
+    if (dlg.ShowModal() == wxID_OK)
+    {
+        const wxColour c = dlg.GetColourData().GetColour(); // may include alpha
+        SetPreviewColor(strokeColorPreview, c);
+
+        if (PathDisplayObject* path = AsPath(m_selected))
+        {
+            // If a segment is selected, change ONLY that segment's stroke
+            if (m_selectedSegmentIndex >= 0 &&
+                m_selectedSegmentIndex < (int)path->GetSegmentCount())
+            {
+                path->SetSegmentStrokeColor((size_t)m_selectedSegmentIndex, c);
+            }
+            else
+            {
+                // fallback: whole path stroke color
+                path->SetStrokeColor(c);
+            }
+
+            RefreshUp(this);
+        }
+    }
+
+    e.Skip();
+}
+
+void PropertiesPanel::OnStrokeSlider(wxCommandEvent& e)
+{
+    const double v = strokeWidthSlider ? (strokeWidthSlider->GetValue() / 10.0) : 2.0;
+    SetStrokeWidthUI(v);
+
+    if (PathDisplayObject* path = AsPath(m_selected))
+    {
+        path->SetStrokeWidth(v);
+        RefreshUp(this);
+    }
+
+    e.Skip();
+}
+
+double PropertiesPanel::GetCurrentStrokeWidth() const
+{
+    if (!strokeWidthSlider)
+        return 2.0;
+    return strokeWidthSlider->GetValue() / 10.0;
+}
+
+void PropertiesPanel::UpdateSectionsForSelection(bool isPath, bool isText, bool isImage)
+{
+    if (m_pathSection)
+        m_pathSection->Show(isPath);
+
+    if (m_textSection)
+        m_textSection->Show(isText);
+
+    if (m_imageSection)
+        m_imageSection->Show(isImage);
+
+    Layout();
+}
+
+void PropertiesPanel::BuildTransformSection(wxBoxSizer* root)
+{
+    const int inputW = 90;
+    const int gapLabelInput = 6;
+    const int gapBetweenPairs = 18;
+
+    m_transformSection = new wxPanel(this);
+    auto* transformSizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* title = new wxStaticText(m_transformSection, wxID_ANY, "POSITION AND SIZE");
+    auto* titleWrap = new wxBoxSizer(wxHORIZONTAL);
+    titleWrap->AddSpacer(10);
+    titleWrap->Add(title, 0, wxTOP, 5);
+    transformSizer->Add(titleWrap, 0, wxBOTTOM, 12);
+
+    auto* xLabel = new wxStaticText(m_transformSection, wxID_ANY, "X");
+    auto* yLabel = new wxStaticText(m_transformSection, wxID_ANY, "Y");
+    auto* wLabel = new wxStaticText(m_transformSection, wxID_ANY, "W");
+    auto* hLabel = new wxStaticText(m_transformSection, wxID_ANY, "H");
+
+    xCtrl = MakeReadOnly(m_transformSection);
+    yCtrl = MakeReadOnly(m_transformSection);
+    wCtrl = MakeReadOnly(m_transformSection);
+    hCtrl = MakeReadOnly(m_transformSection);
+
+    xCtrl->SetMinSize(wxSize(inputW, -1));
+    yCtrl->SetMinSize(wxSize(inputW, -1));
+    wCtrl->SetMinSize(wxSize(inputW, -1));
+    hCtrl->SetMinSize(wxSize(inputW, -1));
+
+    auto* row1 = new wxBoxSizer(wxHORIZONTAL);
+    row1->Add(xLabel, 0, wxALIGN_CENTER_VERTICAL);
+    row1->AddSpacer(gapLabelInput);
+    row1->Add(xCtrl, 0, wxALIGN_CENTER_VERTICAL);
+    row1->AddSpacer(gapBetweenPairs);
+    row1->Add(yLabel, 0, wxALIGN_CENTER_VERTICAL);
+    row1->AddSpacer(gapLabelInput);
+    row1->Add(yCtrl, 0, wxALIGN_CENTER_VERTICAL);
+
+    auto* row2 = new wxBoxSizer(wxHORIZONTAL);
+    row2->Add(wLabel, 0, wxALIGN_CENTER_VERTICAL);
+    row2->AddSpacer(gapLabelInput);
+    row2->Add(wCtrl, 0, wxALIGN_CENTER_VERTICAL);
+    row2->AddSpacer(gapBetweenPairs);
+    row2->Add(hLabel, 0, wxALIGN_CENTER_VERTICAL);
+    row2->AddSpacer(gapLabelInput);
+    row2->Add(hCtrl, 0, wxALIGN_CENTER_VERTICAL);
+
+    transformSizer->Add(row1, 0, wxALIGN_CENTER_HORIZONTAL | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+    transformSizer->Add(row2, 0, wxALIGN_CENTER_HORIZONTAL | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    m_transformSection->SetSizer(transformSizer);
+    root->Add(m_transformSection, 0, wxEXPAND);
+}
+
+void PropertiesPanel::BuildPathSection(wxBoxSizer* root)
+{
+    const int gapLabelInput = 6;
+    const int gapBetweenPairs = 18;
+
+    m_pathSection = new wxPanel(this);
+    auto* pathSizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* sep = new wxStaticLine(m_pathSection, wxID_ANY);
+    pathSizer->Add(sep, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+
+    auto* fillStrokeTitle = new wxStaticText(m_pathSection, wxID_ANY, "FILL AND STROKE");
+    auto* fillStrokeWrap = new wxBoxSizer(wxHORIZONTAL);
+    fillStrokeWrap->AddSpacer(10);
+    fillStrokeWrap->Add(fillStrokeTitle, 0, wxTOP, 5);
+    pathSizer->Add(fillStrokeWrap, 0, wxTOP | wxBOTTOM, 12);
+
+    auto* fillLabel = new wxStaticText(m_pathSection, wxID_ANY, "Fill");
+    auto* strokeLabel = new wxStaticText(m_pathSection, wxID_ANY, "Stroke");
+
+    fillColorPreview = new wxPanel(m_pathSection, wxID_ANY, wxDefaultPosition, wxSize(28, 22), wxBORDER_SIMPLE);
+    strokeColorPreview = new wxPanel(m_pathSection, wxID_ANY, wxDefaultPosition, wxSize(28, 22), wxBORDER_SIMPLE);
+
+    fillColorPreview->SetMinSize(wxSize(28, 22));
+    strokeColorPreview->SetMinSize(wxSize(28, 22));
+
+    fillColorPreview->SetCursor(wxCursor(wxCURSOR_HAND));
+    strokeColorPreview->SetCursor(wxCursor(wxCURSOR_HAND));
+
+    fillColorPreview->SetToolTip("Click to choose fill color");
+    strokeColorPreview->SetToolTip("Click to choose stroke color");
+
+    auto* colorRow = new wxBoxSizer(wxHORIZONTAL);
+    colorRow->Add(fillLabel, 0, wxALIGN_CENTER_VERTICAL);
+    colorRow->AddSpacer(gapLabelInput);
+    colorRow->Add(fillColorPreview, 0, wxALIGN_CENTER_VERTICAL);
+
+    colorRow->AddSpacer(gapBetweenPairs + 24);
+
+    colorRow->Add(strokeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    colorRow->AddSpacer(gapLabelInput);
+    colorRow->Add(strokeColorPreview, 0, wxALIGN_CENTER_VERTICAL);
+
+    pathSizer->Add(colorRow, 0, wxALIGN_CENTER_HORIZONTAL | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    auto* strokeSizeLabel = new wxStaticText(m_pathSection, wxID_ANY, "Stroke");
+
+    strokeWidthSlider = new wxSlider(m_pathSection, wxID_ANY, 2, 0, 500, wxDefaultPosition, wxDefaultSize, wxSL_HORIZONTAL);
+
+    strokeWidthCtrl = new wxTextCtrl(m_pathSection, wxID_ANY, "2.00", wxDefaultPosition, wxDefaultSize, wxTE_READONLY);
+
+    strokeWidthCtrl->SetMinSize(wxSize(90, 28));
+
+    auto* strokeRow = new wxBoxSizer(wxHORIZONTAL);
+    strokeRow->Add(strokeSizeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    strokeRow->AddSpacer(gapLabelInput);
+    strokeRow->Add(strokeWidthSlider, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 8);
+    strokeRow->Add(strokeWidthCtrl, 0, wxALIGN_CENTER_VERTICAL);
+
+    pathSizer->Add(strokeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    m_pathSection->SetSizer(pathSizer);
+    root->Add(m_pathSection, 0, wxEXPAND);
+}
+
+void PropertiesPanel::BuildTextSection(wxBoxSizer* root)
+{
+    const int gapLabelInput = 6;
+    const int leftPad = 10;
+
+    m_textSection = new wxPanel(this);
+    auto* textSizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* textSep = new wxStaticLine(m_textSection, wxID_ANY);
+    textSizer->Add(textSep, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+
+    auto* textTitle = new wxStaticText(m_textSection, wxID_ANY, "CHARACTER");
+    auto* textWrap = new wxBoxSizer(wxHORIZONTAL);
+    textWrap->AddSpacer(leftPad);
+    textWrap->Add(textTitle, 0, wxTOP, 5);
+    textSizer->Add(textWrap, 0, wxTOP | wxBOTTOM, 12);
+
+    // =========================
+    // FAMILY ROW
+    // =========================
+    auto* familyLabel = new wxStaticText(m_textSection, wxID_ANY, "Family:");
+
+    wxArrayString familyChoices = GetSystemFontFaceNames();
+
+    textFamilyChoice = new wxChoice(m_textSection, wxID_ANY, wxDefaultPosition, wxDefaultSize, familyChoices);
+    textFamilyChoice->SetMinSize(wxSize(190, -1));
+
+    int defaultFontIndex = wxNOT_FOUND;
+    if (!familyChoices.IsEmpty())
+    {
+        defaultFontIndex = familyChoices.Index("Arial");
+        if (defaultFontIndex == wxNOT_FOUND)
+            defaultFontIndex = familyChoices.Index("DejaVu Sans");
+        if (defaultFontIndex == wxNOT_FOUND)
+            defaultFontIndex = familyChoices.Index("Segoe UI");
+        if (defaultFontIndex == wxNOT_FOUND)
+            defaultFontIndex = 0;
+
+        textFamilyChoice->SetSelection(defaultFontIndex);
+    }
+
+    auto* familyRow = new wxBoxSizer(wxHORIZONTAL);
+    familyRow->AddSpacer(leftPad);
+    familyRow->Add(familyLabel, 0, wxALIGN_CENTER_VERTICAL);
+    familyRow->AddSpacer(gapLabelInput);
+    familyRow->Add(textFamilyChoice, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 15);
+
+    textSizer->Add(familyRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    // =========================
+    // STYLE ROW
+    // =========================
+    auto* styleLabel = new wxStaticText(m_textSection, wxID_ANY, "Style:");
+
+    wxString styleChoices[] = { "Regular", "Bold", "Italic", "Bold Italic" };
+
+    textStyleChoice = new wxChoice(m_textSection, wxID_ANY, wxDefaultPosition, wxDefaultSize, static_cast<int>(sizeof(styleChoices) / sizeof(styleChoices[0])), styleChoices);
+    textStyleChoice->SetSelection(0);
+    textStyleChoice->SetMinSize(wxSize(110, -1));
+
+    auto* styleRow = new wxBoxSizer(wxHORIZONTAL);
+    styleRow->AddSpacer(leftPad);
+    styleRow->Add(styleLabel, 0, wxALIGN_CENTER_VERTICAL);
+    styleRow->AddSpacer(gapLabelInput);
+    styleRow->Add(textStyleChoice, 1, wxALIGN_CENTER_VERTICAL | wxRIGHT, 15);
+
+    textSizer->Add(styleRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    // =========================
+    // SIZE + LETTER SPACING ROW
+    // =========================
+    auto* sizeLabel = new wxStaticText(m_textSection, wxID_ANY, "Size:");
+    auto* letterSpacingLabel = new wxStaticText(m_textSection, wxID_ANY, "Letter spacing:");
+
+    textSizeCtrl = new wxTextCtrl(m_textSection, wxID_ANY, "22.0", wxDefaultPosition, wxSize(60, -1), wxTE_READONLY);
+    textSizeCtrl->SetMinSize(wxSize(60, -1));
+
+    textLetterSpacingCtrl = new wxTextCtrl(m_textSection, wxID_ANY, "0.0", wxDefaultPosition, wxSize(55, -1), wxTE_READONLY);
+    textLetterSpacingCtrl->SetMinSize(wxSize(55, -1));
+
+    auto* sizeRow = new wxBoxSizer(wxHORIZONTAL);
+    sizeRow->AddSpacer(leftPad);
+    sizeRow->Add(sizeLabel, 0, wxALIGN_CENTER_VERTICAL);
+    sizeRow->AddSpacer(gapLabelInput);
+    sizeRow->Add(textSizeCtrl, 0, wxALIGN_CENTER_VERTICAL);
+    sizeRow->AddSpacer(14);
+    sizeRow->Add(letterSpacingLabel, 0, wxALIGN_CENTER_VERTICAL);
+    sizeRow->AddSpacer(gapLabelInput);
+    sizeRow->Add(textLetterSpacingCtrl, 0, wxALIGN_CENTER_VERTICAL);
+
+    textSizer->Add(sizeRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    // =========================
+    // COLOR + AUTO KERN ROW
+    // =========================
+    auto* colorLabel = new wxStaticText(m_textSection, wxID_ANY, "Color:");
+
+    textColorPreview = new wxPanel(m_textSection, wxID_ANY, wxDefaultPosition, wxSize(36, 22), wxBORDER_SIMPLE);
+    textColorPreview->SetMinSize(wxSize(36, 22));
+    textColorPreview->SetCursor(wxCursor(wxCURSOR_HAND));
+    textColorPreview->SetToolTip("Click to choose text color");
+
+    textAutoKernCheck = new wxCheckBox(m_textSection, wxID_ANY, "Auto kern");
+    textAutoKernCheck->SetValue(true);
+
+    auto* colorRow = new wxBoxSizer(wxHORIZONTAL);
+    colorRow->AddSpacer(leftPad);
+    colorRow->Add(colorLabel, 0, wxALIGN_CENTER_VERTICAL);
+    colorRow->AddSpacer(gapLabelInput);
+    colorRow->Add(textColorPreview, 0, wxALIGN_CENTER_VERTICAL);
+    colorRow->AddSpacer(12);
+    colorRow->Add(textAutoKernCheck, 0, wxALIGN_CENTER_VERTICAL);
+
+    textSizer->Add(colorRow, 0, wxEXPAND | wxLEFT | wxRIGHT | wxBOTTOM, 8);
+
+    m_textSection->SetSizer(textSizer);
+    root->Add(m_textSection, 0, wxEXPAND);
+
+    SetPreviewColor(textColorPreview, *wxBLACK);
+}
+
+void PropertiesPanel::BuildImageSection(wxBoxSizer* root)
+{
+    m_imageSection = new wxPanel(this);
+    auto* imageSizer = new wxBoxSizer(wxVERTICAL);
+
+    auto* imageSep = new wxStaticLine(m_imageSection, wxID_ANY);
+    imageSizer->Add(imageSep, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP, 8);
+
+    auto* imageTitle = new wxStaticText(m_imageSection, wxID_ANY, "IMAGE");
+    auto* imageWrap = new wxBoxSizer(wxHORIZONTAL);
+    imageWrap->AddSpacer(10);
+    imageWrap->Add(imageTitle, 0, wxTOP, 5);
+    imageSizer->Add(imageWrap, 0, wxTOP | wxBOTTOM, 12);
+
+    m_imageSection->SetSizer(imageSizer);
+    root->Add(m_imageSection, 0, wxEXPAND);
+}
+
+void PropertiesPanel::OnTextColorPreviewClick(wxMouseEvent& event)
+{
+}
