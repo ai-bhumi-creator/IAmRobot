@@ -658,3 +658,2835 @@ void PropertiesPanel::BuildImageSection(wxBoxSizer* root)
 void PropertiesPanel::OnTextColorPreviewClick(wxMouseEvent& event)
 {
 }
+========================================================================================================
+#include <wx/wx.h>
+#include <wx/dcbuffer.h>
+#include <wx/brush.h>
+#include <wx/pen.h>
+#include <cmath>
+
+#include "CanvasViewport.h"
+#include "PropertiesPanel.h"
+#include "Document.h"
+#include "SVGImages.h"
+#include "MainFrame.h"
+#include "TextDisplayObject.h"
+#include "PathDisplayObject.h"
+#include "ImageDisplayObject.h"
+
+wxBEGIN_EVENT_TABLE(CanvasViewport, wxPanel)
+    EVT_PAINT(CanvasViewport::OnPaint)
+    EVT_SIZE(CanvasViewport::OnSize)
+    EVT_MOUSEWHEEL(CanvasViewport::OnMouseWheel)
+    EVT_MIDDLE_DOWN(CanvasViewport::OnMiddleDown)
+    EVT_MIDDLE_UP(CanvasViewport::OnMiddleUp)
+    EVT_MOTION(CanvasViewport::OnMouseMove)
+    EVT_LEFT_DOWN(CanvasViewport::OnLeftDown)
+    EVT_LEFT_UP(CanvasViewport::OnLeftUp)
+    EVT_LEAVE_WINDOW(CanvasViewport::OnLeaveWindow)
+    EVT_MOUSE_CAPTURE_LOST(CanvasViewport::OnMouseCaptureLost)
+    EVT_KEY_DOWN(CanvasViewport::OnKeyDown)
+wxEND_EVENT_TABLE()
+
+namespace
+{
+    constexpr double kPi = 3.14159265358979323846;
+    constexpr double kPenCloseRadiusScreen = 8.0;
+    constexpr double kPenPointRadiusScreen = 4.0;
+
+    double AngleDeg(const wxPoint2DDouble& center, const wxPoint2DDouble& p)
+    {
+        const double dx = p.m_x - center.m_x;
+        const double dy = p.m_y - center.m_y;
+        return std::atan2(dy, dx) * 180.0 / kPi;
+    }
+
+    double DistSq(const wxPoint2DDouble& a, const wxPoint2DDouble& b)
+    {
+        const double dx = a.m_x - b.m_x;
+        const double dy = a.m_y - b.m_y;
+        return dx * dx + dy * dy;
+    }
+}
+
+static void RefreshPropertiesFromMainFrame(wxWindow* w)
+{
+    MainFrame* frame = wxDynamicCast(wxGetTopLevelParent(w), MainFrame);
+    if (!frame)
+        return;
+
+    PropertiesPanel* props = frame->GetPropertiesPanel();
+    if (!props)
+        return;
+
+    frame->RefreshPropertiesPanelFromSelection();
+
+    const Document& doc = frame->GetDocument();
+    DisplayObject* selected = doc.GetSelected();
+
+    if (!selected)
+    {
+        props->UpdateSectionsForSelection(false, false, false);
+        return;
+    }
+
+    // Multi-selection proxy: hide all type-specific sections
+    if (dynamic_cast<GroupProxyObject*>(selected) != nullptr)
+    {
+        props->UpdateSectionsForSelection(false, false, false);
+        return;
+    }
+
+    const bool isPath  = dynamic_cast<PathDisplayObject*>(selected) != nullptr;
+    const bool isText  = dynamic_cast<TextDisplayObject*>(selected) != nullptr;
+    const bool isImage = dynamic_cast<ImageDisplayObject*>(selected) != nullptr;
+
+    props->UpdateSectionsForSelection(isPath, isText, isImage);
+}
+
+static wxCursor MakeCursorFromSVG(const char* svg, const wxSize& size, int hotX, int hotY)
+{
+    wxBitmapBundle bundle = wxBitmapBundle::FromSVG(svg, size);
+    wxBitmap bmp = bundle.GetBitmap(size);
+
+    if (!bmp.IsOk())
+        return wxCursor(wxCURSOR_ARROW);
+
+    wxImage img = bmp.ConvertToImage();
+    if (!img.IsOk())
+        return wxCursor(wxCURSOR_ARROW);
+
+    img.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_X, hotX);
+    img.SetOption(wxIMAGE_OPTION_CUR_HOTSPOT_Y, hotY);
+
+    return wxCursor(img);
+}
+
+CanvasViewport::CanvasViewport(wxWindow* parent, ViewportBoard* stage, Document* doc)
+    : wxPanel(parent, wxID_ANY)
+    , m_stage(stage)
+    , m_doc(doc)
+{
+    SetBackgroundStyle(wxBG_STYLE_PAINT);
+    SetDoubleBuffered(true);
+    SetBackgroundColour(wxColour(170, 170, 170));
+    SetCursor(wxCursor(wxCURSOR_ARROW));
+
+    m_circleArrowCursor = MakeCursorFromSVG(SVGImages::CircularArrowCursor, wxSize(30, 30), 15, 15);
+}
+
+void CanvasViewport::ApplyToolState(bool pen, bool rectangle, bool ellipse, bool line)
+{
+    const bool anyDrawTool = pen || rectangle || ellipse || line;
+
+    // Switching to a shape/pen tool: end text editing and disable text tool
+    if (anyDrawTool)
+    {
+        if (m_textEditor)
+            CommitTextEdit();
+
+        m_textToolActive = false;
+    }
+
+    m_penToolActive = pen;
+    m_rectangleToolActive = rectangle;
+    m_ellipseToolActive = ellipse;
+    m_lineToolActive = line;
+
+    if (anyDrawTool && m_doc)
+    {
+        m_doc->ClearSelection();
+        RefreshPropertiesFromMainFrame(this);
+    }
+
+    if (!pen)
+        ResetPenPathPreview();
+
+    UpdateToolCursor();
+    Refresh(false);
+}
+
+bool CanvasViewport::IsDrawToolActive() const
+{
+    return m_penToolActive || m_rectangleToolActive || m_ellipseToolActive || m_lineToolActive;
+}
+
+void CanvasViewport::UpdateToolCursor()
+{
+    if (m_isPanning)
+    {
+        SetCursor(wxCursor(wxCURSOR_HAND));
+        return;
+    }
+
+    if (m_textToolActive)
+    {
+        SetCursor(wxCursor(wxCURSOR_IBEAM));
+        return;
+    }
+
+    const bool drawToolActive = m_penToolActive || m_rectangleToolActive || m_ellipseToolActive || m_lineToolActive;
+
+    SetCursor(wxCursor(drawToolActive ? wxCURSOR_CROSS : wxCURSOR_ARROW));
+}
+
+wxPoint2DDouble CanvasViewport::ClientToWorld(const wxPoint& pt) const
+{
+    if (!m_stage)
+        return wxPoint2DDouble(0.0, 0.0);
+
+    const wxSize cs = GetClientSize();
+
+    const double boardWf = m_stage->GetWidth()  * m_zoom;
+    const double boardHf = m_stage->GetHeight() * m_zoom;
+
+    const double drawX = (cs.x - boardWf) * 0.5 + m_panX;  // ← was missing this
+    const double drawY = (cs.y - boardHf) * 0.5 + m_panY;
+
+    return wxPoint2DDouble((static_cast<double>(pt.x) - drawX) / m_zoom, (static_cast<double>(pt.y) - drawY) / m_zoom);
+}
+
+void CanvasViewport::SetSubselectionMode(bool active)
+{
+    if (m_subselectionMode == active)
+        return;
+
+    m_subselectionMode = active;
+
+    if (!m_subselectionMode)
+        m_subselHover = {};
+
+    Refresh(false);
+}
+
+void CanvasViewport::SetTextToolActive(bool on)
+{
+    // Leaving text tool: commit any active editor
+    if (!on && m_textEditor)
+        CommitTextEdit();
+
+    m_textToolActive = on;
+
+    if (on)
+    {
+        // Turn off other draw tools when text is active (so cursor + clicks behave)
+        m_penToolActive = false;
+        m_rectangleToolActive = false;
+        m_ellipseToolActive = false;
+        m_lineToolActive = false;
+
+        if (m_doc)
+        {
+            m_doc->ClearSelection();
+            RefreshPropertiesFromMainFrame(this);
+        }
+    }
+
+    UpdateToolCursor();
+    Refresh(false);
+}
+
+void CanvasViewport::SetViewFitInWindow()
+{
+    if (!m_stage)
+        return;
+
+    const wxSize cs = GetClientSize();
+    const double stageW = static_cast<double>(m_stage->GetWidth());
+    const double stageH = static_cast<double>(m_stage->GetHeight());
+
+    if (cs.x <= 0 || cs.y <= 0 || stageW <= 0.0 || stageH <= 0.0)
+        return;
+
+    const double padding = 12.0; // small margin on all sides
+
+    const double availW = std::max(1.0, static_cast<double>(cs.x) - padding * 2.0);
+    const double availH = std::max(1.0, static_cast<double>(cs.y) - padding * 2.0);
+
+    const double scaleX = availW / stageW;
+    const double scaleY = availH / stageH;
+
+    m_zoom = std::min(scaleX, scaleY);
+    m_panX = 0.0;
+    m_panY = 0.0;
+
+    Refresh();
+}
+
+void CanvasViewport::SetViewActualSize()
+{
+    if (!m_stage)
+        return;
+
+    m_zoom = 1.0;
+    m_panX = 0.0;
+    m_panY = 0.0;
+
+    Refresh();
+}
+
+//===============================================================================
+//============================= Private functions //=============================
+//===============================================================================
+void CanvasViewport::OnPaint(wxPaintEvent& event)
+{
+    wxAutoBufferedPaintDC dc(this);
+    const wxSize cs = GetClientSize();
+
+    dc.SetBackground(wxBrush(GetBackgroundColour()));
+    dc.Clear();
+
+    if (!m_stage)
+        return;
+
+    const double boardWf = m_stage->GetWidth()  * m_zoom;
+    const double boardHf = m_stage->GetHeight() * m_zoom;
+
+    const double baseX = (cs.x - boardWf) * 0.5;
+    const double baseY = (cs.y - boardHf) * 0.5;
+
+    const double drawX = baseX + m_panX;
+    const double drawY = baseY + m_panY;
+
+    dc.SetPen(*wxTRANSPARENT_PEN);
+    dc.SetBrush(wxBrush(m_stage->GetBackgroundColor()));
+    dc.DrawRectangle((int)drawX, (int)drawY, (int)boardWf, (int)boardHf);
+
+    wxGraphicsContext* gc = wxGraphicsContext::Create(dc);
+    if (!gc)
+        return;
+
+    gc->PushState();
+    gc->Translate(drawX, drawY);
+    gc->Scale(m_zoom, m_zoom);
+
+    PathDisplayObject* selectedPath = nullptr;
+    if (m_subselectionMode)
+        selectedPath = GetSelectedPathObject();
+
+    if (m_doc)
+    {
+        const bool hideTransformGizmo = (m_subselectionMode && selectedPath != nullptr);
+        m_doc->DrawCurrent(gc, m_zoom, !hideTransformGizmo);
+    }
+
+    DrawShapePreview(gc);
+    DrawPenPreview(gc);
+    DrawMarquee(gc);
+
+    if (m_subselectionMode && selectedPath)
+        selectedPath->DrawSubselection(gc, m_zoom, m_subselHover, m_selectedSegmentIndex);
+
+    gc->PopState();
+    delete gc;
+}
+
+void CanvasViewport::OnSize(wxSizeEvent& event)
+{
+    Refresh(false);
+    event.Skip();
+}
+
+void CanvasViewport::OnMouseWheel(wxMouseEvent& event)
+{
+    if (!m_stage)
+        return;
+
+    const int rotation = event.GetWheelRotation();
+    if (rotation == 0)
+        return;
+
+    const wxPoint mousePos = event.GetPosition();
+    const wxSize cs = GetClientSize();
+
+    const double oldZoom = m_zoom;
+
+    const double oldBaseX = (cs.x - (m_stage->GetWidth()  * oldZoom)) * 0.5;
+    const double oldBaseY = (cs.y - (m_stage->GetHeight() * oldZoom)) * 0.5;
+
+    const double worldX = (mousePos.x - (oldBaseX + m_panX)) / oldZoom;
+    const double worldY = (mousePos.y - (oldBaseY + m_panY)) / oldZoom;
+
+    const double zoomFactor = (rotation > 0) ? 1.1 : (1.0 / 1.1);
+    m_zoom *= zoomFactor;
+
+    if (m_zoom < 0.1) m_zoom = 0.1;
+    if (m_zoom > 16.0) m_zoom = 16.0;
+
+    const double newBaseX = (cs.x - (m_stage->GetWidth()  * m_zoom)) * 0.5;
+    const double newBaseY = (cs.y - (m_stage->GetHeight() * m_zoom)) * 0.5;
+
+    m_panX = mousePos.x - newBaseX - (worldX * m_zoom);
+    m_panY = mousePos.y - newBaseY - (worldY * m_zoom);
+
+    Refresh(false);
+}
+
+void CanvasViewport::OnMiddleDown(wxMouseEvent& event)
+{
+    m_isPanning = true;
+    m_lastMousePos = event.GetPosition();
+
+    if (!HasCapture())
+        CaptureMouse();
+
+    SetCursor(wxCursor(wxCURSOR_HAND));
+}
+
+void CanvasViewport::OnMiddleUp(wxMouseEvent& event)
+{
+    if (m_isPanning)
+        m_isPanning = false;
+
+    if (HasCapture())
+        ReleaseMouse();
+
+    UpdateToolCursor();
+}
+
+void CanvasViewport::OnMouseMove(wxMouseEvent& event)
+{
+    if (m_isMarqueeSelecting)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isMarqueeSelecting = false;
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+            Refresh(false);
+            return;
+        }
+
+        m_marqueeCurrentClient = event.GetPosition();
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDrawingShape)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isDrawingShape = false;
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+            Refresh(false);
+            return;
+        }
+
+        m_shapeCurrentStage = ClientToStage(event.GetPosition());
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDraggingSubselHandle)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isDraggingSubselHandle = false;
+            m_draggingInHandle = false;
+            m_dragSubselHandleAnchorIndex = -1;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        PathDisplayObject* path = GetSelectedPathObject();
+        if (!path || m_dragSubselHandleAnchorIndex < 0)
+        {
+            m_isDraggingSubselHandle = false;
+            m_draggingInHandle = false;
+            m_dragSubselHandleAnchorIndex = -1;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+        const wxPoint2DDouble localPt = path->WorldToLocal(stagePt);
+
+        if (m_draggingInHandle)
+        {
+            path->MoveInHandle(static_cast<size_t>(m_dragSubselHandleAnchorIndex), localPt);
+            m_subselHover.type = PathSubselHitType::InHandle;
+        }
+        else
+        {
+            path->MoveOutHandle(static_cast<size_t>(m_dragSubselHandleAnchorIndex), localPt);
+            m_subselHover.type = PathSubselHitType::OutHandle;
+        }
+
+        m_subselHover.anchorIndex = m_dragSubselHandleAnchorIndex;
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDraggingSubselAnchor)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isDraggingSubselAnchor = false;
+            m_dragSubselAnchorIndex = -1;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        PathDisplayObject* path = GetSelectedPathObject();
+        if (!path || m_dragSubselAnchorIndex < 0)
+        {
+            m_isDraggingSubselAnchor = false;
+            m_dragSubselAnchorIndex = -1;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+        const wxPoint2DDouble localPt = path->WorldToLocal(stagePt);
+
+        path->MoveAnchor(static_cast<size_t>(m_dragSubselAnchorIndex), localPt);
+
+        m_subselHover.type = PathSubselHitType::Anchor;
+        m_subselHover.anchorIndex = m_dragSubselAnchorIndex;
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isRotatingObject)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isRotatingObject = false;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+        ApplyRotationFromMouse(stagePt);
+
+        if (IsMultiSelectionActive())
+            ApplyGroupProxyToChildren();
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isScalingObject)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isScalingObject = false;
+            m_activeHandle = TransformGizmo::Handle::None;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+        ApplyScaleFromHandle(stagePt, event.ShiftDown());
+
+        if (IsMultiSelectionActive())
+            ApplyGroupProxyToChildren();
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDraggingObject)
+    {
+        if (!event.LeftIsDown())
+        {
+            m_isDraggingObject = false;
+
+            if (HasCapture() && !m_isPanning)
+                ReleaseMouse();
+
+            return;
+        }
+
+        DisplayObject* selected = GetTransformTarget();
+        if (selected)
+        {
+            const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+            const double dx = stagePt.m_x - m_lastDragStagePos.m_x;
+            const double dy = stagePt.m_y - m_lastDragStagePos.m_y;
+
+            const wxPoint2DDouble pos = selected->GetPosition();
+            selected->SetPosition(pos.m_x + dx, pos.m_y + dy);
+
+            if (IsMultiSelectionActive())
+                ApplyGroupProxyToChildren();
+
+            m_lastDragStagePos = stagePt;
+            RefreshPropertiesFromMainFrame(this);
+            Refresh(false);
+            return;
+        }
+
+        m_isDraggingObject = false;
+    }
+
+    if (m_isPanning)
+    {
+        const wxPoint pos = event.GetPosition();
+        const wxPoint delta = pos - m_lastMousePos;
+        m_lastMousePos = pos;
+
+        m_panX += delta.x;
+        m_panY += delta.y;
+
+        Refresh(false);
+        return;
+    }
+
+    if (IsDrawToolActive())
+    {
+        if (m_penToolActive)
+        {
+            const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+
+            m_hasPenHoverStagePos = true;
+            m_penHoverStagePos = stagePt;
+            m_penHoverPointIndex = HitTestPenPoint(stagePt);
+
+            Refresh(false);
+        }
+
+        UpdateToolCursor();
+        return;
+    }
+
+    if (m_subselectionMode)
+    {
+        PathDisplayObject* path = GetSelectedPathObject();
+        if (path)
+        {
+            const wxPoint2DDouble stagePt = ClientToStage(event.GetPosition());
+            const double safeZoom = (m_zoom > 1e-6) ? m_zoom : 1.0;
+            const double radiusStage = 8.0 / safeZoom;
+
+            PathSubselHit hit = path->HitTestSubselection(stagePt, radiusStage);
+
+            if (hit.type != m_subselHover.type || hit.anchorIndex != m_subselHover.anchorIndex)
+            {
+                m_subselHover = hit;
+                Refresh(false);
+            }
+
+            return;
+        }
+        else
+        {
+            if (m_subselHover.type != PathSubselHitType::None || m_subselHover.anchorIndex != -1)
+            {
+                m_subselHover = {};
+                Refresh(false);
+            }
+        }
+    }
+
+    if (m_textToolActive)
+    {
+        UpdateToolCursor();  // force I-beam
+        return;
+    }
+
+    UpdateTransformCursor(event.GetPosition());
+    event.Skip();
+}
+
+void CanvasViewport::OnMouseCaptureLost(wxMouseCaptureLostEvent& event)
+{
+    m_isPanning = false;
+    m_isDraggingObject = false;
+    m_isScalingObject = false;
+    m_isRotatingObject = false;
+    m_isDraggingSubselAnchor = false;
+    m_dragSubselAnchorIndex = -1;
+    m_isDraggingSubselHandle = false;
+    m_draggingInHandle = false;
+    m_dragSubselHandleAnchorIndex = -1;
+    UpdateToolCursor();
+}
+
+wxPoint2DDouble CanvasViewport::ClientToStage(const wxPoint& pt) const
+{
+    if (!m_stage)
+        return wxPoint2DDouble(0.0, 0.0);
+
+    const wxSize cs = GetClientSize();
+
+    const double boardWf = m_stage->GetWidth()  * m_zoom;
+    const double boardHf = m_stage->GetHeight() * m_zoom;
+
+    const double baseX = (cs.x - boardWf) * 0.5;
+    const double baseY = (cs.y - boardHf) * 0.5;
+
+    const double drawX = baseX + m_panX;
+    const double drawY = baseY + m_panY;
+
+    return wxPoint2DDouble((pt.x - drawX) / m_zoom, (pt.y - drawY) / m_zoom);
+}
+
+void CanvasViewport::OnLeftDown(wxMouseEvent& event)
+{
+    SetFocus();
+
+    if (!m_stage)
+        return;
+
+    const wxPoint mouseClient = event.GetPosition();
+    const wxPoint2DDouble stagePt = ClientToStage(mouseClient);
+
+    // Text tool: click to start editing overlay
+    if (!m_subselectionMode && m_textToolActive)
+    {
+        BeginTextEdit(mouseClient, stagePt);
+        return;
+    }
+
+    // Subselection tool to edit path objects
+    if (m_subselectionMode)
+    {
+        PathDisplayObject* path = GetSelectedPathObject();
+        if (path)
+        {
+            // RemoveAnchor: click an anchor to remove it.
+            // If path has 3 anchors (or fewer), remove whole path object.
+            if (m_subToolType == SubToolType::RemoveAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Anchor && clickHit.anchorIndex >= 0)
+                {
+                    const size_t count = path->GetAnchorCount();
+
+                    // Your rule: if path has 3 anchors and remove-anchor is used => delete whole path
+                    if (count <= 2)
+                    {
+                        // Remove the object from the active frame
+                        Layer* layer = m_doc ? m_doc->GetLayer(m_doc->GetActiveLayerIndex()) : nullptr;
+                        Frame* frame = layer ? layer->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+
+                        if (frame)
+                            frame->RemoveObject(path);
+
+                        if (m_doc)
+                            m_doc->ClearSelection();
+
+                        m_subselHover = {};
+                        m_selectedSegmentIndex = -1;
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                    else
+                    {
+                        // Remove only that anchor
+                        path->RemoveAnchor((size_t)clickHit.anchorIndex);
+
+                        // Reset hover/segment selection so indices don’t point to old anchors
+                        m_subselHover = {};
+                        m_selectedSegmentIndex = -1;
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                }
+            }
+
+            if (m_subToolType == SubToolType::EditAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Segment && clickHit.segmentIndex >= 0)
+                {
+                    m_selectedSegmentIndex = clickHit.segmentIndex;
+                    RefreshPropertiesFromMainFrame(this);
+                    Refresh(false);
+                    return;
+                }
+                else
+                {
+                    m_selectedSegmentIndex = -1; // clicked off segment
+                }
+            }
+
+            // AddAnchor: click on segment to split + insert new anchor
+            if (m_subToolType == SubToolType::AddAnchor)
+            {
+                const double radiusStage = 8.0 / m_zoom;
+                const PathSubselHit clickHit = path->HitTestSubselection(stagePt, radiusStage);
+
+                if (clickHit.type == PathSubselHitType::Segment &&
+                    clickHit.segmentIndex >= 0)
+                {
+                    const int newAnchorIndex = path->InsertAnchorOnSegment(
+                        (size_t)clickHit.segmentIndex, clickHit.t);
+
+                    if (newAnchorIndex >= 0)
+                    {
+                        m_subselHover.type = PathSubselHitType::Anchor;
+                        m_subselHover.anchorIndex = newAnchorIndex;
+                        m_subselHover.segmentIndex = -1;
+
+                        m_isDraggingSubselAnchor = true;
+                        m_dragSubselAnchorIndex = newAnchorIndex;
+                        m_dragSubselLastLocalPos = path->WorldToLocal(stagePt);
+
+                        if (!HasCapture())
+                            CaptureMouse();
+
+                        RefreshPropertiesFromMainFrame(this);
+                        Refresh(false);
+                        return;
+                    }
+                }
+            }
+
+            // Existing handle/anchor drags
+            if (m_subselHover.type == PathSubselHitType::InHandle && m_subselHover.anchorIndex >= 0)
+            {
+                m_isDraggingSubselHandle = true;
+                m_draggingInHandle = true;
+                m_dragSubselHandleAnchorIndex = m_subselHover.anchorIndex;
+
+                if (!HasCapture())
+                    CaptureMouse();
+
+                Refresh(false);
+                return;
+            }
+
+            if (m_subselHover.type == PathSubselHitType::OutHandle && m_subselHover.anchorIndex >= 0)
+            {
+                m_isDraggingSubselHandle = true;
+                m_draggingInHandle = false;
+                m_dragSubselHandleAnchorIndex = m_subselHover.anchorIndex;
+
+                if (!HasCapture())
+                    CaptureMouse();
+
+                Refresh(false);
+                return;
+            }
+
+            if (m_subselHover.type == PathSubselHitType::Anchor && m_subselHover.anchorIndex >= 0)
+            {
+                PathAnchor* anchor = path->GetAnchor((size_t)m_subselHover.anchorIndex);
+                if (anchor)
+                {
+                    m_isDraggingSubselAnchor = true;
+                    m_dragSubselAnchorIndex = m_subselHover.anchorIndex;
+                    m_dragSubselLastLocalPos = path->WorldToLocal(stagePt);
+
+                    if (!HasCapture())
+                        CaptureMouse();
+
+                    Refresh(false);
+                    return;
+                }
+            }
+        }
+    }
+
+    // Start shape drawing (Line / Rectangle / Ellipse)
+    if (!m_subselectionMode && (m_lineToolActive || m_rectangleToolActive || m_ellipseToolActive))
+    {
+        m_isDrawingShape = true;
+        m_shapeStartStage = stagePt;
+        m_shapeCurrentStage = stagePt;
+
+        if (!HasCapture())
+            CaptureMouse();
+
+        Refresh(false);
+        return;
+    }
+
+    if (m_penToolActive)
+    {
+        const int hitIndex = HitTestPenPoint(stagePt);
+
+        if (hitIndex == 0 && m_penPoints.size() >= 3)
+        {
+            CompletePenPath();
+            Refresh(false);
+            return;
+        }
+
+        m_penPoints.push_back(stagePt);
+        m_hasPenHoverStagePos = true;
+        m_penHoverStagePos = stagePt;
+        m_penHoverPointIndex = HitTestPenPoint(stagePt);
+
+        Refresh(false);
+        return;
+    }
+
+    m_isDraggingObject  = false;
+    m_isScalingObject   = false;
+    m_isRotatingObject  = false;
+
+    double drawX = 0.0, drawY = 0.0;
+    GetStageDrawOrigin(drawX, drawY);
+
+    DisplayObject* selected = GetTransformTarget();
+    if (selected)
+    {
+        TransformGizmo& gizmo = m_doc->GetGizmo();
+        TransformGizmo::Handle handle = gizmo.HitTestHandles(mouseClient, drawX, drawY, m_zoom);
+
+        if (handle != TransformGizmo::Handle::None)
+        {
+            m_isScalingObject      = true;
+            m_activeHandle         = handle;
+            m_scaleStartMouseStage = stagePt;
+            m_scaleStartBounds     = selected->GetWorldBounds();
+            m_scaleStartPos        = selected->GetPosition();
+            m_scaleStartScale      = selected->GetScale();
+            m_scaleStartPivot      = selected->GetPivot();
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+
+        if (gizmo.IsInRotateZone(mouseClient, drawX, drawY, m_zoom))
+        {
+            m_isRotatingObject      = true;
+            m_rotateStartMouseStage = stagePt;
+            m_rotateStartDegrees    = selected->GetRotation();
+            const wxRect2DDouble bounds = selected->GetWorldBounds();
+            m_rotateCenterStage = wxPoint2DDouble(
+                bounds.m_x + bounds.m_width  * 0.5,
+                bounds.m_y + bounds.m_height * 0.5
+            );
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+
+        if (selected->HitTestWorld(stagePt))
+        {
+            m_isDraggingObject = true;
+            m_lastDragStagePos = stagePt;
+
+            if (IsMultiSelectionActive())
+                SnapshotMultiForTransform();
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+    }
+
+    DisplayObject* hit = nullptr;
+    Layer* layer = m_doc->GetLayer(m_doc->GetActiveLayerIndex());
+    if (layer)
+    {
+        Frame* frame = layer->GetFrame(m_doc->GetCurrentFrame());
+        if (frame)
+            hit = frame->HitTestTop(stagePt);
+    }
+
+    // Start marquee only in Selection tool (no pen/shape/subselection/text)
+    if (!m_subselectionMode && !m_textToolActive && !IsDrawToolActive())
+    {
+        // Only start marquee if click is on empty space (no object hit)
+        DisplayObject* hit0 = nullptr;
+        Layer* layer0 = m_doc ? m_doc->GetLayer(m_doc->GetActiveLayerIndex()) : nullptr;
+        Frame* frame0 = layer0 ? layer0->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+        if (frame0)
+            hit0 = frame0->HitTestTop(stagePt);
+
+        if (!hit0)
+        {
+            m_isMarqueeSelecting = true;
+            m_marqueeStartClient = mouseClient;
+            m_marqueeCurrentClient = mouseClient;
+
+            if (!HasCapture())
+                CaptureMouse();
+
+            Refresh(false);
+            return;
+        }
+    }
+
+    if (hit)
+    {
+        if (event.ShiftDown())
+        {
+            // Toggle membership in multi selection list
+            auto it = std::find(m_multiSel.begin(), m_multiSel.end(), hit);
+            if (it != m_multiSel.end())
+                m_multiSel.erase(it);
+            else
+                m_multiSel.push_back(hit);
+
+            // If multi (2+), build proxy + target gizmo to proxy
+            if (m_multiSel.size() >= 2)
+            {
+                RebuildGroupProxyFromMultiSel(); // sets gizmo target = proxy
+            }
+            else
+            {
+                // Back to single selection
+                ClearMultiSelection();
+                m_doc->Select(hit);
+            }
+        }
+        else
+        {
+            // Normal click: if clicking within existing multi selection, keep it
+            if (m_multiSel.size() >= 2)
+            {
+                if (std::find(m_multiSel.begin(), m_multiSel.end(), hit) == m_multiSel.end())
+                {
+                    // clicked a different object -> single selection
+                    ClearMultiSelection();
+                    m_doc->Select(hit);
+                }
+                else
+                {
+                    // clicked one of the selected -> keep group proxy as target
+                    RebuildGroupProxyFromMultiSel();
+                }
+            }
+            else
+            {
+                // Single selection normal
+                ClearMultiSelection();
+                m_doc->Select(hit);
+            }
+        }
+
+        // Start dragging (this will drag proxy if group active, else the selected object)
+        m_isDraggingObject = true;
+        m_lastDragStagePos = stagePt;
+
+        if (!HasCapture())
+            CaptureMouse();
+    }
+    else
+    {
+        // Click empty clears both
+        ClearMultiSelection();
+        m_doc->ClearSelection();
+    }
+
+    RefreshPropertiesFromMainFrame(this);
+    Refresh(false);
+}
+
+void CanvasViewport::OnLeftUp(wxMouseEvent& event)
+{
+    if (m_isMarqueeSelecting)
+    {
+        m_isMarqueeSelecting = false;
+        m_marqueeCurrentClient = event.GetPosition();
+
+        if (HasCapture() && !m_isPanning)
+            ReleaseMouse();
+
+        // --- FINISH MARQUEE: select objects intersecting rect ---
+        const wxRect2DDouble r = GetMarqueeStageRect();
+        const double tiny = 2.0 / ((m_zoom > 1e-6) ? m_zoom : 1.0);
+
+        const bool addToExisting = event.ShiftDown();
+
+        // If user just clicked empty (no real drag) => clear selection (Flash-like)
+        if (r.m_width < tiny && r.m_height < tiny)
+        {
+            if (!addToExisting)
+            {
+                ClearMultiSelection();
+                if (m_doc) m_doc->ClearSelection();
+            }
+
+            RefreshPropertiesFromMainFrame(this);
+            Refresh(false);
+            return;
+        }
+
+        // Collect hits from active frame (INTERSECT)
+        std::vector<DisplayObject*> hits;
+        if (m_doc)
+        {
+            Layer* layer = m_doc->GetLayer(m_doc->GetActiveLayerIndex());
+            Frame* frame = layer ? layer->GetFrame(m_doc->GetCurrentFrame()) : nullptr;
+
+            if (frame)
+            {
+                auto& objs = frame->GetObjects();
+                for (auto& up : objs)
+                {
+                    DisplayObject* o = up.get();
+                    if (!o || !o->IsVisible() || o->IsLocked())
+                        continue;
+
+                    if (o->GetWorldBounds().Intersects(r))
+                        hits.push_back(o);
+                }
+            }
+        }
+
+        if (!addToExisting)
+            ClearMultiSelection();
+
+        // Merge hits into m_multiSel (no duplicates)
+        for (DisplayObject* o : hits)
+        {
+            if (!o) continue;
+            if (std::find(m_multiSel.begin(), m_multiSel.end(), o) == m_multiSel.end())
+                m_multiSel.push_back(o);
+        }
+
+        // Apply result
+        if (m_multiSel.empty())
+        {
+            ClearMultiSelection();
+            if (m_doc) m_doc->ClearSelection();
+        }
+        else if (m_multiSel.size() == 1)
+        {
+            // single
+            if (m_doc) m_doc->Select(m_multiSel[0]);
+            ClearMultiSelection(); // keep single selection in Document
+        }
+        else
+        {
+            // group (2+)
+            RebuildGroupProxyFromMultiSel(); // sets gizmo target = proxy
+        }
+
+        RefreshPropertiesFromMainFrame(this);
+        Refresh(false);
+        return;
+    }
+
+    if (m_isDrawingShape)
+    {
+        m_isDrawingShape = false;
+        CompleteShapePath();
+
+        if (HasCapture() && !m_isPanning)
+            ReleaseMouse();
+
+        return;
+    }
+
+    if (m_isDraggingSubselHandle)
+    {
+        m_isDraggingSubselHandle = false;
+        m_draggingInHandle = false;
+        m_dragSubselHandleAnchorIndex = -1;
+    }
+
+    if (m_isDraggingSubselAnchor)
+    {
+        m_isDraggingSubselAnchor = false;
+        m_dragSubselAnchorIndex = -1;
+    }
+
+    if (m_isDraggingObject)
+        m_isDraggingObject = false;
+
+    if (m_isScalingObject)
+    {
+        m_isScalingObject = false;
+        m_activeHandle = TransformGizmo::Handle::None;
+    }
+
+    if (m_isRotatingObject)
+        m_isRotatingObject = false;
+
+    if (HasCapture() && !m_isPanning)
+        ReleaseMouse();
+}
+
+void CanvasViewport::OnKeyDown(wxKeyEvent& event)
+{
+    const int keyCode = event.GetKeyCode();
+
+    if (keyCode == WXK_DELETE || keyCode == WXK_NUMPAD_DELETE)
+    {
+        if (m_doc && m_doc->RemoveSelectedObjectFromActiveFrame())
+        {
+            RefreshPropertiesFromMainFrame(this);
+            Refresh();
+        }
+        return;
+    }
+
+    event.Skip();
+}
+
+bool CanvasViewport::IsStagePointInside(const wxPoint2DDouble& stagePt) const
+{
+    if (!m_stage)
+        return false;
+
+    return stagePt.m_x >= 0.0 && stagePt.m_y >= 0.0 && stagePt.m_x <= m_stage->GetWidth() && stagePt.m_y <= m_stage->GetHeight();
+}
+
+int CanvasViewport::HitTestPenPoint(const wxPoint2DDouble& stagePt) const
+{
+    if (m_penPoints.empty())
+        return -1;
+
+    const double radiusStage = kPenCloseRadiusScreen / m_zoom;
+    const double radiusSq = radiusStage * radiusStage;
+
+    for (size_t i = 0; i < m_penPoints.size(); ++i)
+    {
+        if (DistSq(stagePt, m_penPoints[i]) <= radiusSq)
+            return static_cast<int>(i);
+    }
+
+    return -1;
+}
+
+void CanvasViewport::ResetPenPathPreview()
+{
+    m_penPoints.clear();
+    m_hasPenHoverStagePos = false;
+    m_penHoverPointIndex = -1;
+}
+
+void CanvasViewport::CompletePenPath()
+{
+    if (!m_doc || m_penPoints.size() < 3)
+        return;
+
+    const wxPoint2DDouble origin = m_penPoints.front();
+
+    std::vector<wxPoint2DDouble> localPts;
+    localPts.reserve(m_penPoints.size());
+
+    for (const auto& p : m_penPoints)
+        localPts.emplace_back(p.m_x - origin.m_x, p.m_y - origin.m_y);
+
+    auto pathObj = std::make_unique<PathDisplayObject>();
+    pathObj->SetPoints(localPts);
+    pathObj->SetClosed(true);
+
+    MainFrame* frame = wxDynamicCast(wxGetTopLevelParent(this), MainFrame);
+
+    PropertiesPanel* props = frame ? frame->GetPropertiesPanel() : nullptr;
+    if (props)
+    {
+        pathObj->SetStrokeWidth(props->GetCurrentStrokeWidth());
+        pathObj->SetStrokeColor(props->GetCurrentStrokeColor());
+        pathObj->SetFillColor(props->GetCurrentFillColor());
+    }
+    else
+    {
+        // fallback defaults (same as before)
+        pathObj->SetStrokeWidth(2.0);
+        pathObj->SetStrokeColor(*wxBLACK);
+        pathObj->SetFillColor(*wxWHITE);
+    }
+
+    const wxRect2DDouble localBounds = pathObj->GetLocalBounds();
+    const double pivotX = localBounds.m_x + localBounds.m_width * 0.5;
+    const double pivotY = localBounds.m_y + localBounds.m_height * 0.5;
+
+    pathObj->SetPivot(pivotX, pivotY);
+    pathObj->SetPosition(origin.m_x + pivotX, origin.m_y + pivotY);
+
+    m_doc->AddObjectToActiveFrame(std::move(pathObj));
+    m_doc->ClearSelection();
+
+    RefreshPropertiesFromMainFrame(this);
+    Refresh(false);
+
+    wxWindow* p = GetParent();
+    while (p)
+    {
+        p->Refresh(false);
+        p = p->GetParent();
+    }
+
+    ResetPenPathPreview();
+}
+
+void CanvasViewport::DrawPenPreview(wxGraphicsContext* gc)
+{
+    if (!gc || !m_penToolActive)
+        return;
+
+    const double stroke = 1.0 / m_zoom;
+    const double pointRadius = kPenPointRadiusScreen / m_zoom;
+
+    gc->PushState();
+
+    if (m_penPoints.size() >= 2)
+    {
+        gc->SetBrush(*wxTRANSPARENT_BRUSH);
+        gc->SetPen(wxPen(*wxBLACK, stroke, wxPENSTYLE_SHORT_DASH));
+
+        for (size_t i = 1; i < m_penPoints.size(); ++i)
+        {
+            gc->StrokeLine(
+                m_penPoints[i - 1].m_x, m_penPoints[i - 1].m_y,
+                m_penPoints[i].m_x,     m_penPoints[i].m_y
+            );
+        }
+    }
+
+    if (!m_penPoints.empty() && m_hasPenHoverStagePos)
+    {
+        gc->SetPen(wxPen(*wxBLACK, stroke, wxPENSTYLE_SHORT_DASH));
+
+        const wxPoint2DDouble& last = m_penPoints.back();
+
+        if (m_penHoverPointIndex == 0 && m_penPoints.size() >= 3)
+        {
+            const wxPoint2DDouble& first = m_penPoints.front();
+            gc->StrokeLine(last.m_x, last.m_y, first.m_x, first.m_y);
+        }
+        else
+        {
+            gc->StrokeLine(last.m_x, last.m_y, m_penHoverStagePos.m_x, m_penHoverStagePos.m_y);
+        }
+    }
+
+    for (size_t i = 0; i < m_penPoints.size(); ++i)
+    {
+        double r = pointRadius;
+        if ((int)i == 0 && m_penHoverPointIndex == 0 && m_penPoints.size() >= 3)
+            r = (kPenPointRadiusScreen + 2.0) / m_zoom;
+
+        gc->SetBrush(*wxWHITE_BRUSH);
+        gc->SetPen(wxPen(*wxBLACK, stroke, wxPENSTYLE_SOLID));
+        gc->DrawEllipse(m_penPoints[i].m_x - r, m_penPoints[i].m_y - r, r * 2.0, r * 2.0);
+    }
+
+    gc->PopState();
+}
+
+void CanvasViewport::ApplyScaleFromHandle(const wxPoint2DDouble& currentStagePt, bool keepAspect)
+{
+    if (!m_doc)
+        return;
+
+    DisplayObject* selected = GetTransformTarget();
+    if (!selected)
+        return;
+
+    const wxRect2DDouble local = selected->GetLocalBounds();
+    const double localW = local.m_width;
+    const double localH = local.m_height;
+    if (localW <= 0.0 || localH <= 0.0)
+        return;
+
+    const double lx  = local.m_x;
+    const double ly  = local.m_y;
+    const double lx2 = local.m_x + local.m_width;
+    const double ly2 = local.m_y + local.m_height;
+    const double lxM = (lx + lx2) * 0.5;
+    const double lyM = (ly + ly2) * 0.5;
+
+    wxPoint2DDouble localMoving, localFixed;
+    bool solveSx = true, solveSy = true;
+
+    switch (m_activeHandle)
+    {
+    case TransformGizmo::Handle::TopLeft:
+        localMoving = { lx,  ly  }; localFixed = { lx2, ly2 }; break;
+    case TransformGizmo::Handle::Top:
+        localMoving = { lxM, ly  }; localFixed = { lxM, ly2 }; solveSx = false; break;
+    case TransformGizmo::Handle::TopRight:
+        localMoving = { lx2, ly  }; localFixed = { lx,  ly2 }; break;
+    case TransformGizmo::Handle::Left:
+        localMoving = { lx,  lyM }; localFixed = { lx2, lyM }; solveSy = false; break;
+    case TransformGizmo::Handle::Right:
+        localMoving = { lx2, lyM }; localFixed = { lx,  lyM }; solveSy = false; break;
+    case TransformGizmo::Handle::BottomLeft:
+        localMoving = { lx,  ly2 }; localFixed = { lx2, ly  }; break;
+    case TransformGizmo::Handle::Bottom:
+        localMoving = { lxM, ly2 }; localFixed = { lxM, ly  }; solveSx = false; break;
+    case TransformGizmo::Handle::BottomRight:
+        localMoving = { lx2, ly2 }; localFixed = { lx,  ly  }; break;
+    default:
+        return;
+    }
+
+    const Transform2D startT = selected->GetTransform();
+
+    auto LocalToWorldFrom = [&](const wxPoint2DDouble& lp, const wxPoint2DDouble& pos, const wxPoint2DDouble& scale, double rotDeg, const wxPoint2DDouble& pivot) -> wxPoint2DDouble
+    {
+        Transform2D t;
+        t.SetPosition(pos.m_x, pos.m_y);
+        t.SetScale(scale.m_x, scale.m_y);
+        t.SetRotation(rotDeg);
+        t.SetPivot(pivot.m_x, pivot.m_y);
+        return t.LocalToWorld(lp);
+    };
+
+    const wxPoint2DDouble fixedWorld = LocalToWorldFrom(localFixed, m_scaleStartPos, m_scaleStartScale, selected->GetRotation(), m_scaleStartPivot);
+
+    const double rotRad = selected->GetRotation() * kPi / 180.0;
+    const double c = std::cos(-rotRad);
+    const double s = std::sin(-rotRad);
+
+    const double dx = currentStagePt.m_x - fixedWorld.m_x;
+    const double dy = currentStagePt.m_y - fixedWorld.m_y;
+
+    const double ux = dx * c - dy * s;
+    const double uy = dx * s + dy * c;
+
+    double newSx = m_scaleStartScale.m_x;
+    double newSy = m_scaleStartScale.m_y;
+
+    const double denomX = (localMoving.m_x - localFixed.m_x);
+    const double denomY = (localMoving.m_y - localFixed.m_y);
+
+    if (solveSx && std::fabs(denomX) > 1e-9)
+        newSx = ux / denomX;
+
+    if (solveSy && std::fabs(denomY) > 1e-9)
+        newSy = uy / denomY;
+
+    if (keepAspect)
+    {
+        const double sxAbs = std::fabs(newSx);
+        const double syAbs = std::fabs(newSy);
+        const double unified = (solveSx && solveSy) ? std::max(sxAbs, syAbs) : (solveSx ? sxAbs : syAbs);
+
+        if (solveSx) newSx = (newSx < 0.0 ? -unified : unified);
+        if (solveSy) newSy = (newSy < 0.0 ? -unified : unified);
+    }
+
+    if (std::fabs(newSx) < 1e-4) newSx = (newSx < 0.0 ? -1e-4 : 1e-4);
+    if (std::fabs(newSy) < 1e-4) newSy = (newSy < 0.0 ? -1e-4 : 1e-4);
+
+    selected->SetScale(newSx, newSy);
+
+    const wxPoint2DDouble fixedWorldAfter = LocalToWorldFrom(localFixed, m_scaleStartPos, wxPoint2DDouble(newSx, newSy), selected->GetRotation(), m_scaleStartPivot);
+
+    const double posDx = fixedWorld.m_x - fixedWorldAfter.m_x;
+    const double posDy = fixedWorld.m_y - fixedWorldAfter.m_y;
+
+    selected->SetPosition(m_scaleStartPos.m_x + posDx, m_scaleStartPos.m_y + posDy);
+}
+
+void CanvasViewport::UpdateTransformCursor(const wxPoint& clientPt)
+{
+    // Show ibeam
+    if (m_textToolActive)
+        return;
+
+    if (!m_doc || !m_stage)
+    {
+        if (!m_isPanning)
+            SetCursor(wxCursor(wxCURSOR_ARROW));
+        return;
+    }
+
+    DisplayObject* selected = GetTransformTarget();
+    if (!selected)
+    {
+        if (!m_isPanning)
+            SetCursor(wxCursor(wxCURSOR_ARROW));
+        return;
+    }
+
+    double drawX = 0.0, drawY = 0.0;
+    GetStageDrawOrigin(drawX, drawY);
+
+    TransformGizmo& gizmo = m_doc->GetGizmo();
+    if (gizmo.HitTestHandles(clientPt, drawX, drawY, m_zoom) != TransformGizmo::Handle::None)
+    {
+        SetCursor(wxCursor(wxCURSOR_SIZING));
+        return;
+    }
+
+    if (gizmo.IsInRotateZone(clientPt, drawX, drawY, m_zoom))
+    {
+        SetCursor(m_circleArrowCursor);
+        return;
+    }
+
+    if (!m_isPanning)
+        SetCursor(wxCursor(wxCURSOR_ARROW));
+}
+
+void CanvasViewport::OnLeaveWindow(wxMouseEvent& event)
+{
+    m_hasPenHoverStagePos = false;
+    m_penHoverPointIndex = -1;
+    m_subselHover = {};
+
+    if (!m_isPanning)
+        UpdateToolCursor();
+
+    Refresh(false);
+    event.Skip();
+}
+
+void CanvasViewport::GetStageDrawOrigin(double& drawX, double& drawY) const
+{
+    drawX = 0.0;
+    drawY = 0.0;
+
+    if (!m_stage)
+        return;
+
+    const wxSize cs = GetClientSize();
+
+    const double boardWf = m_stage->GetWidth()  * m_zoom;
+    const double boardHf = m_stage->GetHeight() * m_zoom;
+
+    const double baseX = (cs.x - boardWf) * 0.5;
+    const double baseY = (cs.y - boardHf) * 0.5;
+
+    drawX = baseX + m_panX;
+    drawY = baseY + m_panY;
+}
+
+void CanvasViewport::ApplyRotationFromMouse(const wxPoint2DDouble& currentStagePt)
+{
+    if (!m_doc)
+        return;
+
+    DisplayObject* selected = GetTransformTarget();
+    if (!selected)
+        return;
+
+    const double startAngle = AngleDeg(m_rotateCenterStage, m_rotateStartMouseStage);
+    const double currentAngle = AngleDeg(m_rotateCenterStage, currentStagePt);
+    const double delta = currentAngle - startAngle;
+
+    selected->SetRotation(m_rotateStartDegrees + delta);
+}
+
+PathDisplayObject* CanvasViewport::GetSelectedPathObject() const
+{
+    if (!m_doc)
+        return nullptr;
+
+    DisplayObject* selected = GetTransformTarget();
+    if (!selected)
+        return nullptr;
+
+    if (selected->GetType() != DisplayObjectType::Path)
+        return nullptr;
+
+    return static_cast<PathDisplayObject*>(selected);
+}
+
+void CanvasViewport::DrawShapePreview(wxGraphicsContext* gc)
+{
+    if (!gc || !m_isDrawingShape)
+        return;
+
+    const double safeZoom = (m_zoom > 1e-6) ? m_zoom : 1.0;
+    const double strokeW = 1.0 / safeZoom;
+
+    const double x0 = m_shapeStartStage.m_x;
+    const double y0 = m_shapeStartStage.m_y;
+    const double x1 = m_shapeCurrentStage.m_x;
+    const double y1 = m_shapeCurrentStage.m_y;
+
+    const double minx = std::min(x0, x1);
+    const double miny = std::min(y0, y1);
+    const double w = std::abs(x1 - x0);
+    const double h = std::abs(y1 - y0);
+
+    gc->PushState();
+
+    gc->SetBrush(*wxTRANSPARENT_BRUSH);
+    gc->SetPen(wxPen(*wxBLACK, strokeW, wxPENSTYLE_SHORT_DASH));
+
+    if (m_lineToolActive)
+    {
+        gc->StrokeLine(x0, y0, x1, y1);
+    }
+    else if (m_rectangleToolActive)
+    {
+        // DrawRectangle uses current pen/brush; brush is transparent, so it's outline-only
+        gc->DrawRectangle(minx, miny, w, h);
+    }
+    else if (m_ellipseToolActive)
+    {
+        // DrawEllipse uses current pen/brush; brush is transparent, so it's outline-only
+        gc->DrawEllipse(minx, miny, w, h);
+    }
+
+    gc->PopState();
+}
+
+void CanvasViewport::CompleteShapePath()
+{
+    if (!m_doc)
+        return;
+
+    const double x0 = m_shapeStartStage.m_x;
+    const double y0 = m_shapeStartStage.m_y;
+    const double x1 = m_shapeCurrentStage.m_x;
+    const double y1 = m_shapeCurrentStage.m_y;
+
+    const double minx = std::min(x0, x1);
+    const double miny = std::min(y0, y1);
+    const double w = std::abs(x1 - x0);
+    const double h = std::abs(y1 - y0);
+
+    // ignore tiny drags
+    if ((m_lineToolActive && (w*w + h*h) < 1.0) || (!m_lineToolActive && (w < 1.0 || h < 1.0)))
+        return;
+
+    auto pathObj = std::make_unique<PathDisplayObject>();
+
+    // Build anchors in LOCAL space (origin at bbox top-left)
+    std::vector<PathAnchor> anchors;
+
+    if (m_lineToolActive)
+    {
+        const wxPoint2DDouble origin = m_shapeStartStage;
+        const wxPoint2DDouble end    = m_shapeCurrentStage;
+
+        const wxPoint2DDouble d(end.m_x - origin.m_x, end.m_y - origin.m_y);
+
+        PathAnchor a0;
+        a0.position = wxPoint2DDouble(0, 0);
+        a0.hasOutHandle = true;
+        a0.outHandle = wxPoint2DDouble(d.m_x / 3.0, d.m_y / 3.0);
+        a0.hasInHandle = false;
+        a0.inHandle = a0.position;
+
+        PathAnchor a1;
+        a1.position = wxPoint2DDouble(d.m_x, d.m_y);
+        a1.hasInHandle = true;
+        a1.inHandle = wxPoint2DDouble(d.m_x * 2.0 / 3.0, d.m_y * 2.0 / 3.0);
+        a1.hasOutHandle = false;
+        a1.outHandle = a1.position;
+
+        pathObj->ClearPath();
+        pathObj->AddAnchor(a0);
+        pathObj->AddAnchor(a1);
+
+        const wxRect2DDouble localBounds = pathObj->GetLocalBounds();
+        const double pivotX = localBounds.m_x + localBounds.m_width  * 0.5;
+        const double pivotY = localBounds.m_y + localBounds.m_height * 0.5;
+
+        pathObj->SetPivot(pivotX, pivotY);
+        pathObj->SetPosition(origin.m_x + pivotX, origin.m_y + pivotY);
+    }
+    else if (m_rectangleToolActive)
+    {
+        // local origin at minx,miny
+        const wxPoint2DDouble p0(0, 0);
+        const wxPoint2DDouble p1(w, 0);
+        const wxPoint2DDouble p2(w, h);
+        const wxPoint2DDouble p3(0, h);
+
+        auto makeCorner = [&](const wxPoint2DDouble& prev, const wxPoint2DDouble& cur, const wxPoint2DDouble& next) -> PathAnchor
+        {
+            PathAnchor a;
+            a.position = cur;
+
+            // in-handle along prev->cur (one third back)
+            a.hasInHandle = true;
+            a.inHandle = wxPoint2DDouble(cur.m_x + (prev.m_x - cur.m_x) / 3.0, cur.m_y + (prev.m_y - cur.m_y) / 3.0);
+
+            // out-handle along cur->next (one third forward)
+            a.hasOutHandle = true;
+            a.outHandle = wxPoint2DDouble(cur.m_x + (next.m_x - cur.m_x) / 3.0, cur.m_y + (next.m_y - cur.m_y) / 3.0);
+
+            return a;
+        };
+
+        PathAnchor a0 = makeCorner(p3, p0, p1);
+        PathAnchor a1 = makeCorner(p0, p1, p2);
+        PathAnchor a2 = makeCorner(p1, p2, p3);
+        PathAnchor a3 = makeCorner(p2, p3, p0);
+
+        pathObj->ClearPath();
+        pathObj->AddAnchor(a0);
+        pathObj->AddAnchor(a1);
+        pathObj->AddAnchor(a2);
+        pathObj->AddAnchor(a3);
+
+        // SetClosed() rebuilds segments and auto-generates handles (overwriting ours),
+        // so call it, then restore our corner handles.
+        pathObj->SetClosed(true);
+
+        pathObj->SetAnchor(0, a0);
+        pathObj->SetAnchor(1, a1);
+        pathObj->SetAnchor(2, a2);
+        pathObj->SetAnchor(3, a3);
+
+        const wxRect2DDouble localBounds = pathObj->GetLocalBounds();
+        const double pivotX = localBounds.m_x + localBounds.m_width * 0.5;
+        const double pivotY = localBounds.m_y + localBounds.m_height * 0.5;
+
+        pathObj->SetPivot(pivotX, pivotY);
+        pathObj->SetPosition(minx + pivotX, miny + pivotY);
+    }
+    else if (m_ellipseToolActive)
+    {
+        // 4-cubic ellipse approximation
+        const double k = 0.5522847498307936;
+
+        const double rx = w * 0.5;
+        const double ry = h * 0.5;
+        const double cx = rx;
+        const double cy = ry;
+
+        // anchors: top, right, bottom, left (local space)
+        PathAnchor top, right, bottom, left;
+
+        top.position    = wxPoint2DDouble(cx, cy - ry);
+        right.position  = wxPoint2DDouble(cx + rx, cy);
+        bottom.position = wxPoint2DDouble(cx, cy + ry);
+        left.position   = wxPoint2DDouble(cx - rx, cy);
+
+        // handles (kappa)
+        top.hasInHandle = top.hasOutHandle = true;
+        right.hasInHandle = right.hasOutHandle = true;
+        bottom.hasInHandle = bottom.hasOutHandle = true;
+        left.hasInHandle = left.hasOutHandle = true;
+
+        top.inHandle    = wxPoint2DDouble(cx - k * rx, cy - ry);
+        top.outHandle   = wxPoint2DDouble(cx + k * rx, cy - ry);
+
+        right.inHandle  = wxPoint2DDouble(cx + rx, cy - k * ry);
+        right.outHandle = wxPoint2DDouble(cx + rx, cy + k * ry);
+
+        bottom.inHandle  = wxPoint2DDouble(cx + k * rx, cy + ry);
+        bottom.outHandle = wxPoint2DDouble(cx - k * rx, cy + ry);
+
+        left.inHandle   = wxPoint2DDouble(cx - rx, cy + k * ry);
+        left.outHandle  = wxPoint2DDouble(cx - rx, cy - k * ry);
+
+        pathObj->ClearPath();
+        pathObj->AddAnchor(top);
+        pathObj->AddAnchor(right);
+        pathObj->AddAnchor(bottom);
+        pathObj->AddAnchor(left);
+
+        // IMPORTANT: SetClosed() rebuilds segments and auto-generates handles (clamped).
+        // Restore our exact ellipse handles afterward to prevent "rectangle" look.
+        pathObj->SetClosed(true);
+
+        pathObj->SetAnchor(0, top);
+        pathObj->SetAnchor(1, right);
+        pathObj->SetAnchor(2, bottom);
+        pathObj->SetAnchor(3, left);
+
+        const wxRect2DDouble localBounds = pathObj->GetLocalBounds();
+        const double pivotX = localBounds.m_x + localBounds.m_width * 0.5;
+        const double pivotY = localBounds.m_y + localBounds.m_height * 0.5;
+
+        pathObj->SetPivot(pivotX, pivotY);
+        pathObj->SetPosition(minx + pivotX, miny + pivotY);
+    }
+    else
+    {
+        return;
+    }
+
+    // Apply styles from PropertiesPanel (same as pen)
+    MainFrame* frame = wxDynamicCast(wxGetTopLevelParent(this), MainFrame);
+    PropertiesPanel* props = frame ? frame->GetPropertiesPanel() : nullptr;
+    if (props)
+    {
+        pathObj->SetStrokeWidth(props->GetCurrentStrokeWidth());
+        pathObj->SetStrokeColor(props->GetCurrentStrokeColor());
+        pathObj->SetFillColor(props->GetCurrentFillColor());
+    }
+    else
+    {
+        pathObj->SetStrokeWidth(2.0);
+        pathObj->SetStrokeColor(*wxBLACK);
+        pathObj->SetFillColor(*wxWHITE);
+    }
+
+    m_doc->AddObjectToActiveFrame(std::move(pathObj));
+    m_doc->ClearSelection();
+    RefreshPropertiesFromMainFrame(this);
+    Refresh(false);
+
+    // refresh up (like your pen)
+    wxWindow* p = GetParent();
+    while (p)
+    {
+        p->Refresh(false);
+        p = p->GetParent();
+    }
+}
+
+void CanvasViewport::BeginTextEdit(const wxPoint& clientPos, const wxPoint2DDouble& stagePos)
+{
+    // If already editing, commit the previous one first
+    if (m_textEditor)
+        CommitTextEdit();
+
+    m_textEditorClientPos = clientPos;
+    m_textEditorStagePos = stagePos;
+    m_textCommitInProgress = false;
+    m_textCommitScheduled = false;
+
+    // Border-only look (Flash-like). Background will be matched to stage to appear "transparent".
+    long style = wxTE_PROCESS_ENTER | wxBORDER_SIMPLE;
+    m_textEditor = new wxTextCtrl(this, wxID_ANY, "", clientPos, wxSize(220, 28), style);
+
+    // Text should be black (per your requirement)
+    m_textEditor->SetForegroundColour(*wxBLACK);
+
+    // Make background match the stage so it doesn't appear as a black block.
+    wxColour bg = GetBackgroundColour();
+    if (m_stage)
+        bg = m_stage->GetBackgroundColor();
+    m_textEditor->SetBackgroundColour(bg);
+
+    m_textEditor->SetFocus();
+
+    // ENTER => schedule commit (GTK-safe: don't Destroy inside handler)
+    m_textEditor->Bind(wxEVT_TEXT_ENTER, [this](wxCommandEvent& e)
+    {
+        e.Skip(false);
+        ScheduleCommitTextEdit();
+    });
+
+    // Losing focus => schedule commit
+    m_textEditor->Bind(wxEVT_KILL_FOCUS, [this](wxFocusEvent& e)
+    {
+        e.Skip();
+        ScheduleCommitTextEdit();
+    });
+
+    // ESC => cancel safely
+    m_textEditor->Bind(wxEVT_CHAR_HOOK, [this](wxKeyEvent& e)
+    {
+        const int k = e.GetKeyCode();
+        if (k == WXK_ESCAPE)
+        {
+            CallAfter([this]() { CancelTextEdit(); });
+            return;
+        }
+        e.Skip();
+    });
+
+    m_textEditor->Refresh();
+    Refresh(false);
+}
+
+void CanvasViewport::CancelTextEdit()
+{
+    if (!m_textEditor)
+        return;
+
+    m_textCommitInProgress = true;
+
+    wxTextCtrl* ctrl = m_textEditor;
+    m_textEditor = nullptr;
+
+    ctrl->Destroy();
+    Refresh(false);
+}
+
+void CanvasViewport::CommitTextEdit()
+{
+    if (!m_textEditor || m_textCommitInProgress)
+        return;
+
+    m_textCommitInProgress = true;
+
+    wxTextCtrl* ctrl = m_textEditor;
+    m_textEditor = nullptr;
+
+    const wxString ws = ctrl->GetValue();
+    const std::string text = ws.ToUTF8().data();
+
+    // Hide immediately so UI updates cleanly
+    ctrl->Hide();
+
+    // Destroy safely (we are already in CallAfter context now, but this is extra-safe)
+    ctrl->Destroy();
+
+    if (text.empty() || !m_doc)
+    {
+        m_textCommitInProgress = false;
+        Refresh(false);
+        return;
+    }
+
+    auto t = std::make_unique<TextDisplayObject>();
+    t->SetText(text);
+    t->SetFontSize(18);
+    t->SetTextColor(*wxBLACK);
+
+    t->SetPivot(0.0, 0.0);
+    t->SetPosition(m_textEditorStagePos.m_x, m_textEditorStagePos.m_y);
+
+    m_doc->AddObjectToActiveFrame(std::move(t));
+
+    m_textCommitInProgress = false;
+
+    RefreshPropertiesFromMainFrame(this);
+    Refresh(false);
+
+    // Show dot in frame
+    wxWindow* p = GetParent();
+    while (p)
+    {
+        p->Refresh(false);
+        p = p->GetParent();
+    }
+}
+
+void CanvasViewport::ScheduleCommitTextEdit()
+{
+    if (m_textCommitScheduled)
+        return;
+
+    m_textCommitScheduled = true;
+
+    // Run after current event returns (GTK-safe)
+    CallAfter([this]()
+    {
+        m_textCommitScheduled = false;
+        CommitTextEdit();
+    });
+}
+
+void CanvasViewport::ClearMultiSelection()
+{
+    m_multiSel.clear();
+    m_groupProxy.reset();
+}
+
+DisplayObject* CanvasViewport::GetTransformTarget() const
+{
+    if (IsMultiSelectionActive())
+        return m_groupProxy.get();
+    return m_doc ? m_doc->GetSelected() : nullptr;
+}
+
+void CanvasViewport::RebuildGroupProxyFromMultiSel()
+{
+    if (m_multiSel.size() < 2)
+    {
+        m_groupProxy.reset();
+        return;
+    }
+
+    // Union AABB of all selected objects (world space)
+    bool first = true;
+    double minX=0, minY=0, maxX=0, maxY=0;
+
+    for (DisplayObject* o : m_multiSel)
+    {
+        if (!o) continue;
+        const wxRect2DDouble b = o->GetWorldBounds();
+        if (first)
+        {
+            minX = b.m_x; minY = b.m_y; maxX = b.m_x + b.m_width; maxY = b.m_y + b.m_height;
+            first = false;
+        }
+        else
+        {
+            minX = std::min(minX, b.m_x);
+            minY = std::min(minY, b.m_y);
+            maxX = std::max(maxX, b.m_x + b.m_width);
+            maxY = std::max(maxY, b.m_y + b.m_height);
+        }
+    }
+
+    if (first) { m_groupProxy.reset(); return; }
+
+    const double w = maxX - minX;
+    const double h = maxY - minY;
+    const double cx = minX + w * 0.5;
+    const double cy = minY + h * 0.5;
+
+    if (!m_groupProxy)
+        m_groupProxy = std::make_unique<GroupProxyObject>();
+
+    // Local rect centered at pivot (so rotation looks correct)
+    m_groupProxy->SetLocalRect(wxRect2DDouble(-w * 0.5, -h * 0.5, w, h));
+    m_groupProxy->SetPivot(0.0, 0.0);
+    m_groupProxy->SetPosition(cx, cy);
+    m_groupProxy->SetScale(1.0, 1.0);
+    m_groupProxy->SetRotation(0.0);
+
+    // IMPORTANT: gizmo must target proxy (so selection box/handles follow it)
+    if (m_doc)
+        m_doc->GetGizmo().SetTarget(m_groupProxy.get());
+}
+
+void CanvasViewport::SnapshotMultiForTransform()
+{
+    if (!IsMultiSelectionActive())
+        return;
+
+    m_groupStartT = m_groupProxy->GetTransform();
+    m_groupStartRotDeg = m_groupProxy->GetRotation();
+    m_groupStartScale = m_groupProxy->GetScale();
+
+    m_childStartLocalPos.clear();
+    m_childStartScale.clear();
+    m_childStartRot.clear();
+
+    m_childStartLocalPos.reserve(m_multiSel.size());
+    m_childStartScale.reserve(m_multiSel.size());
+    m_childStartRot.reserve(m_multiSel.size());
+
+    for (DisplayObject* o : m_multiSel)
+    {
+        if (!o) continue;
+
+        const wxPoint2DDouble p0 = o->GetPosition();
+        const wxPoint2DDouble localP = m_groupStartT.WorldToLocal(p0);
+
+        m_childStartLocalPos.push_back(localP);
+        m_childStartScale.push_back(o->GetScale());
+        m_childStartRot.push_back(o->GetRotation());
+    }
+}
+
+void CanvasViewport::ApplyGroupProxyToChildren()
+{
+    if (!IsMultiSelectionActive())
+        return;
+
+    const Transform2D curT = m_groupProxy->GetTransform();
+    const wxPoint2DDouble curScale = m_groupProxy->GetScale();
+    const double curRot = m_groupProxy->GetRotation();
+
+    const double sxFactor = (std::abs(m_groupStartScale.m_x) > 1e-9) ? (curScale.m_x / m_groupStartScale.m_x) : 1.0;
+    const double syFactor = (std::abs(m_groupStartScale.m_y) > 1e-9) ? (curScale.m_y / m_groupStartScale.m_y) : 1.0;
+    const double dRot = curRot - m_groupStartRotDeg;
+
+    // apply to each selected object
+    size_t i = 0;
+    for (DisplayObject* o : m_multiSel)
+    {
+        if (!o) { ++i; continue; }
+
+        // Position: map the saved group-local point through CURRENT group transform
+        const wxPoint2DDouble newPos = curT.LocalToWorld(m_childStartLocalPos[i]);
+        o->SetPosition(newPos.m_x, newPos.m_y);
+
+        // Scale: multiply by group scale factors (Flash-like)
+        const wxPoint2DDouble s0 = m_childStartScale[i];
+        o->SetScale(s0.m_x * sxFactor, s0.m_y * syFactor);
+
+        // Rotation: add group delta (Flash-like)
+        o->SetRotation(m_childStartRot[i] + dRot);
+
+        ++i;
+    }
+}
+
+wxRect2DDouble CanvasViewport::GetMarqueeStageRect() const
+{
+    const wxPoint2DDouble a = ClientToStage(m_marqueeStartClient);
+    const wxPoint2DDouble b = ClientToStage(m_marqueeCurrentClient);
+
+    const double x = std::min(a.m_x, b.m_x);
+    const double y = std::min(a.m_y, b.m_y);
+    const double w = std::abs(a.m_x - b.m_x);
+    const double h = std::abs(a.m_y - b.m_y);
+
+    return wxRect2DDouble(x, y, w, h);
+}
+
+void CanvasViewport::DrawMarquee(wxGraphicsContext* gc)
+{
+    if (!gc || !m_isMarqueeSelecting)
+        return;
+
+    const wxRect2DDouble r = GetMarqueeStageRect();
+    if (r.m_width < 1e-6 || r.m_height < 1e-6)
+        return;
+
+    const double safeZoom = (m_zoom > 1e-6) ? m_zoom : 1.0;
+    const double lineW = 1.0 / safeZoom;
+
+    gc->PushState();
+    gc->SetBrush(*wxTRANSPARENT_BRUSH);
+    gc->SetPen(wxPen(wxColour(0, 0, 0), lineW, wxPENSTYLE_SOLID));
+    gc->DrawRectangle(r.m_x, r.m_y, r.m_width, r.m_height);
+    gc->PopState();
+}
+
+void CanvasViewport::UpdatePropertiesPanelForSelection()
+{
+    MainFrame* frame = wxDynamicCast(wxGetTopLevelParent(this), MainFrame);
+    if (!frame)
+        return;
+
+    PropertiesPanel* props = frame->GetPropertiesPanel();
+    if (!props)
+        return;
+
+    DisplayObject* selected = m_doc ? m_doc->GetSelected() : nullptr;
+    if (!selected)
+    {
+        props->UpdateSectionsForSelection(false, false, false);
+        return;
+    }
+
+    const bool isPath  = dynamic_cast<PathDisplayObject*>(selected)  != nullptr;
+    const bool isText  = dynamic_cast<TextDisplayObject*>(selected) != nullptr;
+    const bool isImage = dynamic_cast<ImageDisplayObject*>(selected) != nullptr;
+
+    props->UpdateSectionsForSelection(isPath, isText, isImage);
+}
+=================================================================================================
+#include <wx/wx.h>
+#include <wx/aui/aui.h>
+#include <wx/sizer.h>
+#include <wx/stattext.h>
+#include <wx/filedlg.h>
+#include <wx/msgdlg.h>
+#include <wx/statline.h>
+#include <wx/spinctrl.h>
+
+#include "MainFrame.h"
+#include "SVGImages.h"
+#include "ImageDisplayObject.h"
+#include "CanvasPanel.h"
+#include "Document.h"
+#include "ImageObject.h"
+
+static wxBitmap MakeSVGToolbarBitmap(const char* svg, const wxSize& size)
+{
+    return wxBitmapBundle::FromSVG(svg, size).GetBitmap(size);
+}
+
+MainFrame::MainFrame()
+    : wxFrame(nullptr, wxID_ANY, "SVG Editor", wxDefaultPosition, wxSize(1366, 768)),
+      m_aui(this)
+{
+    AddMenuBar();
+    AddAuiLayout();
+
+    CreateStatusBar(2);
+    SetStatusText("Ready...");
+
+    AddKeypressBind();
+
+    m_aui.Update();
+    m_centerAui.Update();
+
+    RefreshPropertiesPanelFromSelection();
+}
+
+MainFrame::~MainFrame()
+{
+    m_centerAui.UnInit();
+    m_aui.UnInit();
+}
+
+void MainFrame::AddMenuBar()
+{
+    // File menu
+    wxMenu* fileMenu = new wxMenu;
+    fileMenu->Append(ID_FILE_NEW, "&New\tCtrl+N");
+    fileMenu->Append(ID_FILE_OPEN, "&Open\tCtrl+O");
+    fileMenu->Append(ID_FILE_SAVE, "&Save\tCtrl+S");
+    fileMenu->Append(ID_FILE_SAVE_AS, "Save &As\tCtrl+Shift+S");
+    fileMenu->AppendSeparator();
+    wxMenu* importMenu = new wxMenu();
+    importMenu->Append(ID_FILE_IMPORT_TO_STAGE, "Import to Stage\tCtrl+R");
+    importMenu->Append(ID_FILE_IMPORT_TO_LIB, "Import to Library");
+    fileMenu->AppendSubMenu(importMenu, "Import");
+    wxMenu* exportMenu = new wxMenu();
+    exportMenu->Append(ID_FILE_EXPORT_IMAGE, "Export Image\tCtrl+E");
+    exportMenu->Append(ID_FILE_EXPORT_MOVIE, "Export Movie");
+    fileMenu->AppendSubMenu(exportMenu, "Export");
+    fileMenu->AppendSeparator();
+    fileMenu->Append(ID_FILE_EXIT, "E&xit\tAlt+X");
+
+    // Edit menu
+    wxMenu* editMenu = new wxMenu;
+    editMenu->Append(ID_EDIT_UNDO, "Undo\tCtrl+Z");
+    editMenu->Append(ID_EDIT_REDO, "Redo\tCtrl+Z");
+
+    // View menu
+    wxMenu* viewMenu = new wxMenu();
+    viewMenu->Append(ID_VIEW_ZOOM_IN, "Zoom In\tCtrl+=");
+    viewMenu->Append(ID_VIEW_ZOOM_OUT, "Zoom Out\tCtrl+-");
+    viewMenu->AppendSeparator();
+    viewMenu->Append(ID_VIEW_FIT_IN_WINDOW, "Fit in Window");
+    viewMenu->Append(ID_VIEW_ACTUAL_SIZE, "Actual Size");
+
+    // Insert menu
+    wxMenu* insertMenu = new wxMenu();
+
+    // Modify menu
+    wxMenu* modifyMenu = new wxMenu();
+    modifyMenu->Append(ID_MODIFY_DOCUMENT, "Document Properties...\tCtrl+J");
+
+    // Text menu
+    wxMenu* textMenu = new wxMenu();
+
+    // Control menu
+    wxMenu* controlMenu = new wxMenu();
+
+    // Window menu
+    wxMenu* windowMenu = new wxMenu();
+
+    // Help menu
+    wxMenu* helpMenu = new wxMenu;
+    helpMenu->Append(ID_HELP_ABOUT, "&About\tF1");
+
+    // Menu bar
+    wxMenuBar* menuBar = new wxMenuBar;
+    menuBar->Append(fileMenu, "&File");
+    menuBar->Append(editMenu, "&Edit");
+    menuBar->Append(viewMenu, "&View");
+    menuBar->Append(insertMenu, "&Insert");
+    menuBar->Append(modifyMenu, "&Modify");
+    menuBar->Append(textMenu, "&Text");
+    menuBar->Append(controlMenu, "&Control");
+    menuBar->Append(windowMenu, "&Window");
+    menuBar->Append(helpMenu, "&Help");
+
+    SetMenuBar(menuBar);
+
+    // Main menu binding
+    Bind(wxEVT_MENU, &MainFrame::OnExit, this, ID_FILE_EXIT);
+    Bind(wxEVT_MENU, &MainFrame::OnImportToStage, this, ID_FILE_IMPORT_TO_STAGE);
+    // View menu binding
+    Bind(wxEVT_MENU, &MainFrame::OnFitInWindow, this, ID_VIEW_FIT_IN_WINDOW);
+    Bind(wxEVT_MENU, &MainFrame::OnActualSize, this, ID_VIEW_ACTUAL_SIZE);
+    // Modify menu binding
+    Bind(wxEVT_MENU, &MainFrame::OnDocumentProperties, this, ID_MODIFY_DOCUMENT);
+    // Help menu binding
+    Bind(wxEVT_MENU, &MainFrame::OnAbout, this, ID_HELP_ABOUT);
+}
+
+wxPanel* MainFrame::CreatePlaceholderPanel(wxWindow* parent, const wxString& label)
+{
+    Centre();
+
+    wxPanel* panel = new wxPanel(parent, wxID_ANY);
+
+    wxBoxSizer* sizer = new wxBoxSizer(wxVERTICAL);
+    wxStaticText* text = new wxStaticText(panel, wxID_ANY, label);
+    text->SetForegroundColour(*wxWHITE);
+
+    sizer->AddSpacer(10);
+    sizer->Add(text, 0, wxLEFT | wxTOP, 10);
+    panel->SetSizer(sizer);
+
+    return panel;
+}
+
+void MainFrame::AddAuiLayout()
+{
+    constexpr int TOOLBAR_W = 44;
+    constexpr int RIGHT_PANEL_W = 300;
+    constexpr int TIMELINE_H = 220;
+
+    // -----------------------------
+    // Left toolbar pane (outer AUI)
+    // -----------------------------
+    m_toolsPanel = CreatePlaceholderPanel(this, "");
+    m_toolsPanel->SetMinSize(wxSize(TOOLBAR_W, -1));
+    m_toolsPanel->SetMaxSize(wxSize(TOOLBAR_W, -1));
+
+    wxBoxSizer* toolsSizer = new wxBoxSizer(wxVERTICAL);
+
+    // Selection tool
+    m_toolSelection = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_SELECTION, MakeSVGToolbarBitmap(SVGImages::SelectionTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolSubselection = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_SUBSELECTION, MakeSVGToolbarBitmap(SVGImages::SubselectionTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolPen = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_PEN, MakeSVGToolbarBitmap(SVGImages::PenTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolRectangle = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_RECTANGLE, MakeSVGToolbarBitmap(SVGImages::RectangleTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolEllipse = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_ELLIPSE, MakeSVGToolbarBitmap(SVGImages::EllipseTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolLine = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_LINE, MakeSVGToolbarBitmap(SVGImages::LineTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolText = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_TEXT, MakeSVGToolbarBitmap(SVGImages::TextTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolSnap = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_SNAP, MakeSVGToolbarBitmap(SVGImages::SnapTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+
+    // Tooltip text
+    m_toolSelection->SetToolTip("Selection Tool (V)");
+    m_toolSubselection->SetToolTip("Subselection Tool (A)");
+    m_toolPen->SetToolTip("Pen Tool (P)");
+    m_toolRectangle->SetToolTip("Rectangle Tool (R)");
+    m_toolEllipse->SetToolTip("Ellipse Tool (E)");
+    m_toolLine->SetToolTip("Line Tool (L)");
+    m_toolText->SetToolTip("Text Tool (T)");
+    m_toolSnap->SetToolTip("Snap Tool");
+
+    // Since this is the only tool for now, keep it selected by default.
+    m_toolSelection->SetValue(m_activeTool == ToolType::Selection);
+    m_toolSubselection->SetValue(m_activeTool == ToolType::Subselection);
+    m_toolPen->SetValue(m_activeTool == ToolType::Pen);
+    m_toolRectangle->SetValue(m_activeTool == ToolType::Rectangle);
+    m_toolEllipse->SetValue(m_activeTool == ToolType::Ellipse);
+    m_toolLine->SetValue(m_activeTool == ToolType::Line);
+    m_toolText->SetValue(m_activeTool == ToolType::Text);
+
+    // Tool button
+    toolsSizer->Add(m_toolSelection, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolSubselection, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolPen, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolRectangle, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolEllipse, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolLine, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+    toolsSizer->Add(m_toolText, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+
+    // separator
+    auto* sep1 = new wxStaticLine(m_toolsPanel, wxID_ANY);
+    toolsSizer->Add(sep1, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 8);
+
+    // Snap tool
+    toolsSizer->Add(m_toolSnap, 0, wxALL | wxALIGN_TOP | wxALIGN_CENTER_HORIZONTAL, 2);
+
+    auto* sep2 = new wxStaticLine(m_toolsPanel, wxID_ANY);
+    toolsSizer->Add(sep2, 0, wxEXPAND | wxLEFT | wxRIGHT | wxTOP | wxBOTTOM, 8);
+
+    m_toolEditAnchor = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_EDIT_ANCHOR, MakeSVGToolbarBitmap(SVGImages::EditAnchorTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolAddAnchor = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_ADD_ANCHOR, MakeSVGToolbarBitmap(SVGImages::AddAnchorTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+    m_toolRemoveAnchor = new wxBitmapToggleButton(m_toolsPanel, ID_TOOL_REMOVE_ANCHOR, MakeSVGToolbarBitmap(SVGImages::RemoveAnchorTool, wxSize(20, 20)), wxDefaultPosition, wxSize(32, 32));
+
+    m_toolEditAnchor->SetToolTip("Edit Anchor");
+    m_toolAddAnchor->SetToolTip("Add Anchor");
+    m_toolRemoveAnchor->SetToolTip("Remove Anchor");
+
+    toolsSizer->Add(m_toolEditAnchor,   0, wxALL | wxALIGN_CENTER_HORIZONTAL, 4);
+    toolsSizer->Add(m_toolAddAnchor,    0, wxALL | wxALIGN_CENTER_HORIZONTAL, 4);
+    toolsSizer->Add(m_toolRemoveAnchor, 0, wxALL | wxALIGN_CENTER_HORIZONTAL, 4);
+
+    m_subselectionTool = SubToolType::EditAnchor;
+    LastSelectToolId(ID_TOOL_EDIT_ANCHOR);
+
+    if (m_toolEditAnchor)   m_toolEditAnchor->Show(false);
+    if (m_toolAddAnchor)    m_toolAddAnchor->Show(false);
+    if (m_toolRemoveAnchor) m_toolRemoveAnchor->Show(false);
+
+    m_toolsPanel->SetSizer(toolsSizer);
+
+    // Add toolbar
+    m_aui.AddPane(m_toolsPanel, wxAuiPaneInfo().Name("").Caption("").Left().Layer(1).Position(0).MinSize(TOOLBAR_W, 700).BestSize(TOOLBAR_W, 800).MaxSize(TOOLBAR_W, -1).FloatingSize(TOOLBAR_W, 700).Resizable(true).CloseButton(false).MaximizeButton(false).TopDockable(false).BottomDockable(false));
+
+    // -----------------------------
+    // Right tabs pane (outer AUI)
+    // -----------------------------
+    m_rightTabs = new wxAuiNotebook(this, wxID_ANY, wxDefaultPosition, wxDefaultSize, wxAUI_NB_TOP | wxAUI_NB_SCROLL_BUTTONS | wxAUI_NB_TAB_MOVE);
+
+    m_ColorPanel      = CreatePlaceholderPanel(m_rightTabs, "COLOR");
+    m_rightTabs->AddPage(m_ColorPanel, "COLOR", false);
+
+    m_propertiesPanel = new PropertiesPanel(m_rightTabs);
+    m_libraryPanel = new LibraryPanel(m_rightTabs);
+
+    m_rightTabs->AddPage(m_propertiesPanel, "PROPERTIES", true);
+    m_rightTabs->AddPage(m_libraryPanel, "LIBRARY", false);
+
+    m_aui.AddPane(m_rightTabs, wxAuiPaneInfo().Name("right_tabs").Caption("Panels").Right().Layer(1).Position(0).MaximizeButton(false).MinSize(RIGHT_PANEL_W, 700).BestSize(RIGHT_PANEL_W, 800).FloatingSize(RIGHT_PANEL_W, 700).Resizable(true).CloseButton(true).MaximizeButton(false).TopDockable(false).BottomDockable(false));
+
+    // -----------------------------
+    // Center host pane (outer AUI)
+    // -----------------------------
+    m_centerHost = new wxPanel(this, wxID_ANY);
+    m_centerHost->SetBackgroundColour(wxColour(35, 35, 35));
+
+    m_aui.AddPane(m_centerHost, wxAuiPaneInfo().Name("center_host").CenterPane().PaneBorder(false));
+
+    // -----------------------------
+    // Inner AUI manager for center-only docking
+    // -----------------------------
+    m_centerAui.SetManagedWindow(m_centerHost);
+    m_centerAui.SetFlags(wxAUI_MGR_DEFAULT);
+
+    m_canvasPanel = new CanvasPanel(m_centerHost, &m_stage, &m_doc);
+
+
+    m_timelinePanel = new TimelinePanel(m_centerHost, &m_doc);
+    m_timelinePanel->SetMinSize(wxSize(300, 140));
+    m_timelinePanel->SetInitialSize(wxSize(-1, TIMELINE_H));
+
+    // Canvas = center of centerHost
+    m_centerAui.AddPane(m_canvasPanel, wxAuiPaneInfo().Name("canvas").CenterPane().PaneBorder(false));
+
+    // Timeline = dockable inside centerHost only
+    m_centerAui.AddPane(m_timelinePanel, wxAuiPaneInfo().Name("timeline").Caption("Timeline").Bottom().Layer(1).Position(0).Resizable(true).CloseButton(true).MaximizeButton(false).TopDockable(true).BottomDockable(true).LeftDockable(false).RightDockable(false).Floatable(true));
+
+    // Toolbar binding
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolSelection, this, ID_TOOL_SELECTION);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolSubselection, this, ID_TOOL_SUBSELECTION);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolPen, this, ID_TOOL_PEN);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRectangle, this, ID_TOOL_RECTANGLE);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolEllipse, this, ID_TOOL_ELLIPSE);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolLine, this, ID_TOOL_LINE);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolText, this, ID_TOOL_TEXT);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolEditAnchor, this, ID_TOOL_EDIT_ANCHOR);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolAddAnchor, this, ID_TOOL_ADD_ANCHOR);
+    Bind(wxEVT_TOGGLEBUTTON, &MainFrame::OnToolRemoveAnchor, this, ID_TOOL_REMOVE_ANCHOR);
+}
+
+// ------------------------------------------------
+// Keypress bind
+// ------------------------------------------------
+void MainFrame::AddKeypressBind()
+{
+    Bind(wxEVT_CHAR_HOOK, &MainFrame::OnCharHook, this);
+}
+
+// ------------------------------------------------
+// File menu
+// ------------------------------------------------
+void MainFrame::OnImportToStage(wxCommandEvent& event)
+{
+    wxFileDialog openFileDialog(
+        this,
+        "Import Image to Stage",
+        "",
+        "",
+        "Image files (*.png;*.jpg;*.jpeg;*.bmp;*.gif)|*.png;*.jpg;*.jpeg;*.bmp;*.gif|All files (*.*)|*.*",
+        wxFD_OPEN | wxFD_FILE_MUST_EXIST
+    );
+
+    if (openFileDialog.ShowModal() != wxID_OK)
+        return;
+
+    const wxString filePath = openFileDialog.GetPath();
+
+    const LibraryPanel::Item* libItem = m_libraryPanel->AddImageFromFile(filePath);
+    if (!libItem)
+    {
+        wxMessageBox("Failed to load image:\n" + filePath, "Import Error", wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    auto obj = std::make_unique<ImageObject>();
+    obj->SetAssetId(libItem->id);
+    obj->SetBitmap(libItem->bitmap);
+    obj->SetNativeSize(libItem->nativeSize.GetWidth(), libItem->nativeSize.GetHeight());
+
+    const wxRect2DDouble b = obj->GetLocalBounds();
+
+    obj->SetPivot(b.m_width * 0.5, b.m_height * 0.5);
+
+    Transform2D& t = obj->GetTransform();
+    t.SetPosition(b.m_width * 0.5, b.m_height * 0.5);
+    t.SetRotation(0.0);
+    t.SetScale(1.0, 1.0);
+
+    m_doc.AddObjectToActiveFrame(std::move(obj));
+
+    RefreshPropertiesPanelFromSelection();
+
+    m_libraryPanel->Refresh();
+
+    if (m_canvasPanel && m_canvasPanel->GetViewport())
+        m_canvasPanel->GetViewport()->Refresh(false);
+}
+
+void MainFrame::OnExit(wxCommandEvent& event)
+{
+    Close(true);
+}
+
+// ------------------------------------------------
+// View menu
+// ------------------------------------------------
+void MainFrame::OnFitInWindow(wxCommandEvent& event)
+{
+    if (!m_canvasPanel)
+        return;
+
+    if (m_canvasPanel->GetViewChoice())
+        m_canvasPanel->GetViewChoice()->SetSelection(0);
+
+    if (m_canvasPanel->GetViewport())
+        m_canvasPanel->GetViewport()->SetViewFitInWindow();
+}
+
+void MainFrame::OnActualSize(wxCommandEvent& event)
+{
+    if (!m_canvasPanel)
+        return;
+
+    if (m_canvasPanel->GetViewChoice())
+        m_canvasPanel->GetViewChoice()->SetSelection(1);
+
+    if (m_canvasPanel->GetViewport())
+        m_canvasPanel->GetViewport()->SetViewActualSize();
+}
+
+// ------------------------------------------------
+// Modify menu
+// ------------------------------------------------
+void MainFrame::OnDocumentProperties(wxCommandEvent& event)
+{
+    if (!m_canvasPanel)
+        return;
+
+    m_canvasPanel->ShowBoardSettingsDialog(event);
+}
+
+// ------------------------------------------------
+// Help menu
+// ------------------------------------------------
+void MainFrame::OnAbout(wxCommandEvent& event)
+{
+    wxMessageBox("wxAUI base layout:\n"
+                 "- Toolbar width 40\n"
+                 "- Right tabs: Properties + Library\n"
+                 "- Timeline under center area",
+                 "About",
+                 wxOK | wxICON_INFORMATION,
+                 this);
+}
+
+// ------------------------------------------------
+// Set actove tool
+// ------------------------------------------------
+void MainFrame::SetActiveTool(ToolType tool)
+{
+    m_activeTool = tool;
+
+    if (m_toolSelection)
+        m_toolSelection->SetValue(tool == ToolType::Selection);
+
+    if (m_toolSubselection)
+        m_toolSubselection->SetValue(tool == ToolType::Subselection);
+
+    if (m_toolPen)
+        m_toolPen->SetValue(tool == ToolType::Pen);
+
+    if (m_toolRectangle)
+        m_toolRectangle->SetValue(tool == ToolType::Rectangle);
+
+    if (m_toolEllipse)
+        m_toolEllipse->SetValue(tool == ToolType::Ellipse);
+
+    if (m_toolLine)
+        m_toolLine->SetValue(tool == ToolType::Line);
+
+    if (m_toolText)
+        m_toolText->SetValue(tool == ToolType::Text);
+
+    if (m_canvasPanel && m_canvasPanel->GetViewport())
+    {
+        auto* viewport = m_canvasPanel->GetViewport();
+        viewport->SetSubselectionMode(tool == ToolType::Subselection);
+        viewport->SetSubToolType(m_subselectionTool);
+        viewport->ApplyToolState(tool == ToolType::Pen, tool == ToolType::Rectangle, tool == ToolType::Ellipse, tool == ToolType::Line);
+        viewport->SetTextToolActive(tool == ToolType::Text);
+    }
+
+    ShowHideSubselectionTool();
+}
+
+void MainFrame::OnToolSelection(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Selection);
+}
+
+void MainFrame::OnToolSubselection(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Subselection);
+}
+
+void MainFrame::OnToolPen(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Pen);
+}
+
+void MainFrame::OnToolRectangle(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Rectangle);
+}
+
+void MainFrame::OnToolEllipse(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Ellipse);
+}
+
+void MainFrame::OnToolLine(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Line);
+}
+
+void MainFrame::OnToolText(wxCommandEvent& event)
+{
+    SetActiveTool(ToolType::Text);
+}
+
+void MainFrame::OnToolSnap(wxCommandEvent& event)
+{
+
+}
+
+void MainFrame::ApplySubselectionToViewport()
+{
+    if (!m_canvasPanel)
+        return;
+
+    CanvasViewport* vp = m_canvasPanel->GetViewport();
+    if (!vp)
+        return;
+
+    vp->SetSubselectionMode(m_activeTool == ToolType::Subselection);
+    vp->SetSubToolType(m_subselectionTool);
+    vp->Refresh(false);
+}
+
+void MainFrame::OnToolEditAnchor(wxCommandEvent& event)
+{
+    if (!event.IsChecked()) { m_toolEditAnchor->SetValue(true); return; }
+
+    // Make sure we're in subselection tool
+    if (m_activeTool != ToolType::Subselection)
+        SetActiveTool(ToolType::Subselection);
+
+    m_subselectionTool = SubToolType::EditAnchor;
+    LastSelectToolId(ID_TOOL_EDIT_ANCHOR);
+
+    ApplySubselectionToViewport();
+}
+
+void MainFrame::OnToolAddAnchor(wxCommandEvent& event)
+{
+    if (!event.IsChecked()) { m_toolAddAnchor->SetValue(true); return; }
+
+    if (m_activeTool != ToolType::Subselection)
+        SetActiveTool(ToolType::Subselection);
+
+    m_subselectionTool = SubToolType::AddAnchor;
+    LastSelectToolId(ID_TOOL_ADD_ANCHOR);
+
+    ApplySubselectionToViewport();
+}
+
+void MainFrame::OnToolRemoveAnchor(wxCommandEvent& event)
+{
+    if (!event.IsChecked()) { m_toolRemoveAnchor->SetValue(true); return; }
+
+    if (m_activeTool != ToolType::Subselection)
+        SetActiveTool(ToolType::Subselection);
+
+    m_subselectionTool = SubToolType::RemoveAnchor;
+    LastSelectToolId(ID_TOOL_REMOVE_ANCHOR);
+
+    ApplySubselectionToViewport();
+}
+
+void MainFrame::ShowHideSubselectionTool()
+{
+    const bool show = (m_activeTool == ToolType::Subselection);
+
+    if (m_toolEditAnchor)   m_toolEditAnchor->Show(show);
+    if (m_toolAddAnchor)    m_toolAddAnchor->Show(show);
+    if (m_toolRemoveAnchor) m_toolRemoveAnchor->Show(show);
+
+    if (m_toolsPanel)
+        m_toolsPanel->Layout();
+
+    if (m_toolsPanel && m_toolsPanel->GetSizer())
+        m_toolsPanel->GetSizer()->Layout();
+}
+
+void MainFrame::LastSelectToolId(int toolId)
+{
+    m_lastAnchorToolId = toolId;
+
+    m_toolEditAnchor->SetValue(toolId == ID_TOOL_EDIT_ANCHOR);
+    m_toolAddAnchor->SetValue(toolId == ID_TOOL_ADD_ANCHOR);
+    m_toolRemoveAnchor->SetValue(toolId == ID_TOOL_REMOVE_ANCHOR);
+}
+
+// Add a shared event handler for all three anchor buttons
+void MainFrame::OnAnchorToolToggle(wxCommandEvent& event)
+{
+    // Prevent unchecking the active button — always keep one selected
+    wxBitmapToggleButton* btn = dynamic_cast<wxBitmapToggleButton*>(event.GetEventObject());
+    if (btn && !event.IsChecked())
+    {
+        btn->SetValue(true);
+        return;
+    }
+
+    const int toolId = event.GetId();
+
+    if (toolId == ID_TOOL_EDIT_ANCHOR)
+        m_subselectionTool = SubToolType::EditAnchor;
+    else if (toolId == ID_TOOL_ADD_ANCHOR)
+        m_subselectionTool = SubToolType::AddAnchor;
+    else if (toolId == ID_TOOL_REMOVE_ANCHOR)
+        m_subselectionTool = SubToolType::RemoveAnchor;
+
+    LastSelectToolId(toolId);
+}
+
+// ------------------------------------------------
+// Delete library items
+// ------------------------------------------------
+void MainFrame::OnCharHook(wxKeyEvent& event)
+{
+    // Don't steal keys while user is typing in any text input (including our text overlay wxTextCtrl)
+    wxWindow* focus = wxWindow::FindFocus();
+    if (focus)
+    {
+        if (wxDynamicCast(focus, wxTextCtrl) || wxDynamicCast(focus, wxComboBox) || wxDynamicCast(focus, wxSpinCtrl) || wxDynamicCast(focus, wxSpinCtrlDouble))
+        {
+            event.Skip();
+            return;
+        }
+    }
+
+    // Ignore modified keys (we'll use Ctrl for undo/redo later)
+    if (event.ControlDown() || event.AltDown() || event.MetaDown())
+    {
+        event.Skip();
+        return;
+    }
+
+    int key = event.GetKeyCode();
+
+    // Normalize lowercase -> uppercase
+    if (key >= 'a' && key <= 'z')
+        key = key - 'a' + 'A';
+
+    switch (key)
+    {
+    case 'V': // Selection
+        SetActiveTool(ToolType::Selection);
+        break;
+
+    case 'A': // Subselection (EditAnchor)
+        m_subselectionTool = SubToolType::EditAnchor;
+        SetActiveTool(ToolType::Subselection);
+        // Optional: keep your UI remembering last anchor tool
+        // LastSelectToolId(ID_TOOL_EDIT_ANCHOR);
+        break;
+
+    case 'P': // Pen
+        SetActiveTool(ToolType::Pen);
+        break;
+
+    case 'R': // Rectangle
+        SetActiveTool(ToolType::Rectangle);
+        break;
+
+    case 'O': // Ellipse
+        SetActiveTool(ToolType::Ellipse);
+        break;
+
+    case 'L': // Line
+        SetActiveTool(ToolType::Line);
+        break;
+
+    case 'T': // Text
+        SetActiveTool(ToolType::Text);
+        break;
+
+    default:
+        event.Skip();
+        return;
+    }
+
+    // We handled it
+    event.Skip(false);
+}
+
+void MainFrame::RemoveSelectedFromStage()
+{
+    if (!m_doc.RemoveSelectedObjectFromActiveFrame())
+        return;
+
+    RefreshPropertiesPanelFromSelection();
+
+    if (m_libraryPanel)
+        m_libraryPanel->Refresh(false);
+
+    if (m_timelinePanel)
+        m_timelinePanel->RefreshAll();
+
+    if (m_canvasPanel && m_canvasPanel->GetViewport())
+        m_canvasPanel->GetViewport()->Refresh(false);
+}
+
+void MainFrame::RefreshPropertiesPanelFromSelection()
+{
+    if (!m_propertiesPanel)
+        return;
+
+    int seg = -1;
+    if (m_canvasPanel && m_canvasPanel->GetViewport())
+        seg = m_canvasPanel->GetViewport()->GetSelectedSegmentIndex();
+
+    m_propertiesPanel->SetTarget(&m_doc, m_doc.GetSelected(), seg);
+}
+
+void MainFrame::RemoveSelectedFromLibrary()
+{
+    if (!m_libraryPanel)
+        return;
+
+    const LibraryPanel::Item* selected = m_libraryPanel->GetSelectedItem();
+    if (!selected)
+        return;
+
+    const std::string assetId = selected->id;
+    const wxString itemName = selected->name;
+
+    const int answer = wxMessageBox(
+        "Remove \"" + itemName + "\" from Library?\n\nThis will also remove all its instances from the stage.",
+        "Remove from Library",
+        wxYES_NO | wxICON_WARNING,
+        this
+    );
+
+    if (answer != wxYES)
+        return;
+
+    m_doc.RemoveAllObjectsWithAssetId(assetId);
+    m_libraryPanel->RemoveItemById(assetId);
+
+    RefreshPropertiesPanelFromSelection();
+
+    if (m_timelinePanel)
+        m_timelinePanel->RefreshAll();
+
+    if (m_canvasPanel && m_canvasPanel->GetViewport())
+        m_canvasPanel->GetViewport()->Refresh(false);
+
+    m_libraryPanel->Refresh(false);
+}
